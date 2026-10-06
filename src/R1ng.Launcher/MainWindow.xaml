@@ -1,0 +1,548 @@
+<Window x:Class="R1ng.Launcher.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:R1ng.Launcher.Controls"
+        xmlns:converters="clr-namespace:R1ng.Launcher.Converters"
+        Title="R1ng Launcher"
+        Width="760"
+        SizeToContent="Height"
+        MaxHeight="520"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Topmost="True"
+        WindowStartupLocation="Manual"
+        UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display"
+        SnapsToDevicePixels="True">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <converters:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility" />
+        <converters:StringToVisibilityConverter x:Key="StringToVisibility" />
+
+        <!--
+            All colours come from the swappable palette installed by ThemeManager (Theming/
+            ThemePalette.cs) through DynamicResource, so changing the theme repaints the live UI.
+        -->
+
+        <Style x:Key="ChipStyle" TargetType="RadioButton">
+            <Setter Property="Margin" Value="6,0,0,0" />
+            <Setter Property="Padding" Value="12,5" />
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="ChipBorder"
+                                CornerRadius="9"
+                                Background="{DynamicResource ChipBackgroundBrush}"
+                                BorderBrush="{DynamicResource ChipBorderBrush}"
+                                BorderThickness="1"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ChipBorder" Property="Background" Value="{DynamicResource ChipHoverBackgroundBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="ChipBorder" Property="Background" Value="{DynamicResource AccentBrush}" />
+                                <Setter TargetName="ChipBorder" Property="BorderBrush" Value="Transparent" />
+                                <Setter Property="Foreground" Value="{DynamicResource ChipCheckedTextBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="QuickToggleStyle" TargetType="ToggleButton">
+            <Setter Property="Width" Value="30" />
+            <Setter Property="Height" Value="24" />
+            <Setter Property="Margin" Value="2,0,0,0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="FontSize" Value="11.5" />
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Border x:Name="ToggleBorder"
+                                CornerRadius="5"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                BorderThickness="1">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ToggleBorder" Property="Background" Value="{DynamicResource ToggleHoverBackgroundBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="ToggleBorder" Property="Background" Value="{DynamicResource ToggleCheckedBackgroundBrush}" />
+                                <Setter TargetName="ToggleBorder" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource ChipCheckedTextBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.35" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="FooterButtonStyle" TargetType="Button">
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Padding" Value="10,3" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="QuitButtonBorder"
+                                CornerRadius="6"
+                                Background="{DynamicResource FooterButtonBackgroundBrush}"
+                                BorderBrush="{DynamicResource FooterButtonBorderBrush}"
+                                BorderThickness="1"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="QuitButtonBorder" Property="Background" Value="{DynamicResource FooterButtonHoverBackgroundBrush}" />
+                                <Setter TargetName="QuitButtonBorder" Property="BorderBrush" Value="{DynamicResource FooterButtonHoverBorderBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource FooterButtonHoverTextBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!--
+            Neutral footer actions (已隐藏 / 编辑中): same chrome as the quit button but with the regular
+            chip hover instead of the red hover that is reserved for quitting.
+        -->
+        <Style x:Key="FooterActionButtonStyle" TargetType="Button">
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Padding" Value="10,3" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ActionButtonBorder"
+                                CornerRadius="6"
+                                Background="{DynamicResource FooterButtonBackgroundBrush}"
+                                BorderBrush="{DynamicResource FooterButtonBorderBrush}"
+                                BorderThickness="1"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ActionButtonBorder" Property="Background" Value="{DynamicResource ChipHoverBackgroundBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="ResultItemStyle" TargetType="ListBoxItem">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0,1" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="RowBackground" CornerRadius="8" Background="Transparent" Padding="10,7">
+                            <ContentPresenter />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource ResultHoverBackgroundBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource ResultSelectedBackgroundBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <DataTemplate x:Key="ResultTemplate">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="26" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <Grid Width="22" Height="22" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Glyph}"
+                               FontFamily="Segoe MDL2 Assets"
+                               FontSize="15"
+                               Foreground="{DynamicResource TextSecondaryBrush}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Visibility="{Binding HasIcon, Converter={StaticResource InverseBoolToVisibility}}" />
+                    <Image Source="{Binding Icon}"
+                           Width="22"
+                           Height="22"
+                           RenderOptions.BitmapScalingMode="HighQuality"
+                           Visibility="{Binding HasIcon, Converter={StaticResource BoolToVisibility}}" />
+                </Grid>
+
+                <StackPanel Grid.Column="1" Margin="10,0,10,0" VerticalAlignment="Center">
+                    <TextBlock controls:TitleHighlighter.Text="{Binding Title}"
+                               controls:TitleHighlighter.MatchIndices="{Binding Model.TitleMatchIndices}"
+                               controls:TitleHighlighter.HighlightBrush="{DynamicResource HighlightBrush}"
+                               Foreground="{DynamicResource TextPrimaryBrush}"
+                               FontSize="14.5"
+                               TextTrimming="CharacterEllipsis" />
+                    <TextBlock Text="{Binding Detail}"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               FontSize="11.5"
+                               TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Source}"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               FontSize="11"
+                               Margin="0,0,8,0"
+                               VerticalAlignment="Center" />
+                    <Border Background="{DynamicResource TypeBadgeBackgroundBrush}" CornerRadius="6" Padding="7,2">
+                        <TextBlock Text="{Binding TypeLabel}"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   FontSize="11" />
+                    </Border>
+                </StackPanel>
+
+                <Grid.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="打开" Command="{Binding OpenCommand}" InputGestureText="Enter" />
+                        <MenuItem Header="打开所在位置" Command="{Binding OpenContainingFolderCommand}" InputGestureText="Ctrl+Enter" />
+                        <MenuItem Header="QuickLook 预览" Command="{Binding PreviewCommand}" InputGestureText="Ctrl+Space" />
+                        <Separator />
+                        <MenuItem Header="复制路径" Command="{Binding CopyPathCommand}" InputGestureText="Ctrl+C" />
+                        <MenuItem Header="{Binding PinHeader}" Command="{Binding TogglePinCommand}" />
+                        <MenuItem Header="隐藏此项" Command="{Binding HideCommand}" />
+                    </ContextMenu>
+                </Grid.ContextMenu>
+            </Grid>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="14">
+        <Border x:Name="CardBorder"
+                CornerRadius="14"
+                Background="{DynamicResource CardBackgroundBrush}"
+                BorderBrush="{DynamicResource CardBorderBrush}"
+                BorderThickness="1">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="22" ShadowDepth="4" Opacity="0.5" Color="#000000" />
+            </Border.Effect>
+
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Search box -->
+                <Grid Grid.Row="0" Margin="16,14,16,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0"
+                               Text="&#xE721;"
+                               FontFamily="Segoe MDL2 Assets"
+                               FontSize="18"
+                               Margin="2,0,10,0"
+                               VerticalAlignment="Center"
+                               Foreground="{DynamicResource TextSecondaryBrush}" />
+                    <Grid Grid.Column="1">
+                        <TextBlock Text="搜索应用和文件…"
+                                   FontSize="19"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource TextMutedBrush}"
+                                   IsHitTestVisible="False"
+                                   Visibility="{Binding ShowPlaceholder, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBox x:Name="SearchBox"
+                                 Text="{Binding Query, UpdateSourceTrigger=PropertyChanged}"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 FontSize="19"
+                                 Foreground="{DynamicResource TextPrimaryBrush}"
+                                 CaretBrush="{DynamicResource TextPrimaryBrush}"
+                                 SelectionBrush="{DynamicResource AccentBrush}"
+                                 VerticalContentAlignment="Center"
+                                 SpellCheck.IsEnabled="False"
+                                 Style="{x:Null}" />
+                    </Grid>
+
+                    <!-- Quick toggles (Everything QUERY2 search flags). File search only. -->
+                    <StackPanel Grid.Column="2"
+                                Orientation="Horizontal"
+                                VerticalAlignment="Center"
+                                Margin="8,0,0,0"
+                                ToolTipService.ShowOnDisabled="True">
+                        <ToggleButton Content="Aa"
+                                      IsChecked="{Binding IsMatchCase, Mode=TwoWay}"
+                                      Style="{StaticResource QuickToggleStyle}"
+                                      AutomationProperties.Name="区分大小写"
+                                      ToolTip="区分大小写 (Aa)&#x0a;仅影响文件搜索结果；应用匹配始终不区分大小写" />
+                        <ToggleButton IsChecked="{Binding IsMatchWholeWord, Mode=TwoWay}"
+                                      IsEnabled="{Binding IsWholeWordOptionEnabled}"
+                                      Style="{StaticResource QuickToggleStyle}"
+                                      AutomationProperties.Name="全字匹配"
+                                      ToolTip="全字匹配 (Abl)&#x0a;仅影响文件搜索结果；正则模式下不可用（Everything 会忽略）">
+                            <TextBlock Text="Abl"
+                                       FontSize="10.5"
+                                       TextDecorations="Underline, Overline" />
+                        </ToggleButton>
+                        <ToggleButton Content="..\"
+                                      IsChecked="{Binding IsMatchPath, Mode=TwoWay}"
+                                      Style="{StaticResource QuickToggleStyle}"
+                                      AutomationProperties.Name="匹配路径"
+                                      ToolTip="匹配路径 (..\)&#x0a;在完整路径中搜索，而不仅是文件名（仅文件搜索）" />
+                        <ToggleButton Content=".*"
+                                      FontWeight="Bold"
+                                      IsChecked="{Binding IsRegex, Mode=TwoWay}"
+                                      Style="{StaticResource QuickToggleStyle}"
+                                      AutomationProperties.Name="正则表达式"
+                                      ToolTip="正则表达式 (.*)&#x0a;将查询作为 Everything 正则表达式（仅文件搜索）" />
+                    </StackPanel>
+                </Grid>
+
+                <!-- Scope chips -->
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="16,2,16,10">
+                    <RadioButton GroupName="Scope" Style="{StaticResource ChipStyle}" Content="全部"
+                                 IsChecked="{Binding IsScopeAll, Mode=TwoWay}" />
+                    <RadioButton GroupName="Scope" Style="{StaticResource ChipStyle}" Content="应用"
+                                 IsChecked="{Binding IsScopeApplications, Mode=TwoWay}" />
+                    <RadioButton GroupName="Scope" Style="{StaticResource ChipStyle}" Content="文件"
+                                 IsChecked="{Binding IsScopeFiles, Mode=TwoWay}" />
+                    <Border Background="{DynamicResource TypeBadgeBackgroundBrush}" CornerRadius="6" Padding="8,3" Margin="12,0,0,0" VerticalAlignment="Center"
+                            Visibility="{Binding ShowFileNotice, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Text="Everything 未连接" FontSize="11" Foreground="{DynamicResource WarningAccentTextBrush}" />
+                    </Border>
+                </StackPanel>
+
+                <Border Grid.Row="1" Height="2" VerticalAlignment="Bottom" Margin="16,0,16,4">
+                    <ProgressBar IsIndeterminate="True"
+                                 Height="2"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 Foreground="{DynamicResource AccentBrush}"
+                                 Visibility="{Binding IsSearching, Converter={StaticResource BoolToVisibility}}" />
+                </Border>
+
+                <!-- Results -->
+                <Grid Grid.Row="2" Margin="8,0,8,0">
+                    <ListBox x:Name="ResultsList"
+                             ItemsSource="{Binding Results}"
+                             SelectedIndex="{Binding SelectedIndex, Mode=TwoWay}"
+                             ItemTemplate="{StaticResource ResultTemplate}"
+                             ItemContainerStyle="{StaticResource ResultItemStyle}"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             Focusable="False"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             VirtualizingPanel.ScrollUnit="Pixel" />
+
+                    <TextBlock Text="{Binding StatusText}"
+                               Margin="24"
+                               MaxWidth="520"
+                               TextWrapping="Wrap"
+                               TextAlignment="Center"
+                               FontSize="13"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Visibility="{Binding ShowStateMessage, Converter={StaticResource BoolToVisibility}}" />
+                </Grid>
+
+                <!-- File backend banner -->
+                <Border Grid.Row="3"
+                        Margin="16,8,16,0"
+                        Padding="10,7"
+                        CornerRadius="8"
+                        Background="{DynamicResource WarningBackgroundBrush}"
+                        Visibility="{Binding ShowFileNotice, Converter={StaticResource BoolToVisibility}}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE7BA;"
+                                   FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13"
+                                   Margin="0,0,8,0"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource WarningTextBrush}" />
+                        <TextBlock Text="{Binding FileNotice}"
+                                   FontSize="11.5"
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource WarningTextBrush}"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Global hotkey banner: honest fallback/failure status with an exit route. -->
+                <Border Grid.Row="4"
+                        Margin="16,8,16,0"
+                        Padding="10,7"
+                        CornerRadius="8"
+                        Visibility="{Binding ShowHotKeyNotice, Converter={StaticResource BoolToVisibility}}">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Background" Value="{DynamicResource WarningBackgroundBrush}" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsHotKeyFailure}" Value="True">
+                                    <Setter Property="Background" Value="{DynamicResource FailureBackgroundBrush}" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE7BA;"
+                                   FontFamily="Segoe MDL2 Assets"
+                                   FontSize="13"
+                                   Margin="0,0,8,0"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource WarningTextBrush}" />
+                        <TextBlock Text="{Binding HotKeyNotice}"
+                                   FontSize="11.5"
+                                   TextWrapping="Wrap"
+                                   VerticalAlignment="Center">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Foreground" Value="{DynamicResource WarningTextBrush}" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsHotKeyFailure}" Value="True">
+                                            <Setter Property="Foreground" Value="{DynamicResource FailureTextBrush}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+
+                <!-- Footer -->
+                <Grid Grid.Row="5" Margin="16,10,16,12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Result count, or the notice of the last hide / restore / preview / edit action. -->
+                    <TextBlock x:Name="FooterHintText"
+                               Grid.Row="0"
+                               Grid.Column="0"
+                               Text="{Binding DisplayFooterHint}"
+                               ToolTip="{Binding DisplayFooterHint}"
+                               TextTrimming="CharacterEllipsis"
+                               FontSize="11"
+                               VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasActionNotice}" Value="True">
+                                        <Setter Property="Foreground" Value="{DynamicResource WarningAccentTextBrush}" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+
+                    <!-- Visible only while a notepad editing session is active (set by the window). -->
+                    <Button x:Name="EditingButton"
+                            Grid.Row="0"
+                            Grid.Column="1"
+                            Content="编辑中"
+                            Margin="12,0,0,0"
+                            Visibility="Collapsed"
+                            Style="{StaticResource FooterActionButtonStyle}"
+                            Click="OnEditingButtonClick"
+                            AutomationProperties.Name="记事本编辑中">
+                        <Button.ContextMenu>
+                            <ContextMenu x:Name="EditingMenu">
+                                <MenuItem x:Name="ApplySavedMenuItem"
+                                          Header="应用已保存内容"
+                                          Click="OnApplySavedEditorTextClick"
+                                          IsEnabled="False" />
+                                <MenuItem x:Name="EndEditingMenuItem"
+                                          Header="结束编辑"
+                                          Click="OnEndEditingClick" />
+                            </ContextMenu>
+                        </Button.ContextMenu>
+                    </Button>
+
+                    <Button x:Name="HiddenItemsButton"
+                            Grid.Row="0"
+                            Grid.Column="2"
+                            Content="{Binding HiddenButtonText}"
+                            Margin="12,0,0,0"
+                            Style="{StaticResource FooterActionButtonStyle}"
+                            Command="{Binding ManageHiddenCommand}"
+                            AutomationProperties.Name="{Binding HiddenButtonText}"
+                            ToolTip="查看并恢复已隐藏的结果" />
+                    <ComboBox x:Name="ThemeSelector"
+                              Grid.Row="0"
+                              Grid.Column="3"
+                              Margin="12,0,0,0"
+                              Width="84"
+                              ItemsSource="{Binding ThemeOptions}"
+                              DisplayMemberPath="DisplayName"
+                              SelectedValuePath="Value"
+                              SelectedValue="{Binding Theme, Mode=TwoWay}"
+                              AutomationProperties.Name="界面主题"
+                              ToolTip="界面主题（深色/浅色）&#x0a;选择后立即生效并保存到 %AppData%\r1ng-launcher\settings.json" />
+                    <Button Grid.Row="0"
+                            Grid.Column="4"
+                            Content="退出"
+                            Margin="12,0,0,0"
+                            Style="{StaticResource FooterButtonStyle}"
+                            Command="{Binding QuitCommand}"
+                            AutomationProperties.Name="退出 r1ng-launcher"
+                            ToolTip="退出 r1ng-launcher（释放全局热键与单实例锁）" />
+
+                    <TextBlock Grid.Row="1"
+                               Grid.Column="0"
+                               Grid.ColumnSpan="5"
+                               Margin="0,6,0,0"
+                               FontSize="11"
+                               TextTrimming="CharacterEllipsis"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               VerticalAlignment="Center"
+                               Text="Tab 范围 · ↑↓ 选择 · Enter 打开 · Ctrl+Enter 位置 · Ctrl+Space 预览 · Ctrl+G 记事本编辑 · Esc 关闭" />
+                </Grid>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
