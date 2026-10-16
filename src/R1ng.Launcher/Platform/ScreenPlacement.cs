@@ -56,8 +56,170 @@ public static class ScreenPlacement
         );
     }
 
+    /// <summary>
+    /// Places the launcher beside every visible preview rectangle where possible. The launcher size is
+    /// always preserved; all inputs and outputs are device pixels, independent of the monitor's DIP scale.
+    /// Right is preferred, then left. When neither side fits, candidates are clamped and ranked by their
+    /// total overlap area, with the larger available side preferred on ties.
+    /// </summary>
+    public static AvoidancePlacement? PlaceBeside(
+        PixelsRect launcherBounds,
+        IReadOnlyList<PixelsRect> previewBounds,
+        PixelsRect workArea,
+        int gap = 16)
+    {
+        ArgumentNullException.ThrowIfNull(previewBounds);
+        if (gap < 0)
+            throw new ArgumentOutOfRangeException(nameof(gap));
+        if (launcherBounds.Width <= 0 || launcherBounds.Height <= 0
+            || workArea.Width <= 0 || workArea.Height <= 0)
+        {
+            return null;
+        }
+
+        var previews = previewBounds
+            .Where(rect => rect.Width > 0 && rect.Height > 0 && Intersects(rect, workArea))
+            .Distinct()
+            .ToArray();
+        if (previews.Length == 0)
+            return null;
+
+        var minX = workArea.Left;
+        var maxX = Math.Max((long)minX, (long)workArea.Right - launcherBounds.Width);
+        var minY = workArea.Top;
+        var maxY = Math.Max((long)minY, (long)workArea.Bottom - launcherBounds.Height);
+        var xOptions = new List<(int X, int SideRank)>();
+        var yOptions = new HashSet<int>();
+
+        void AddX(long x, int sideRank) => xOptions.Add((ClampPosition(x, minX, maxX), sideRank));
+        void AddY(long y) => yOptions.Add(ClampPosition(y, minY, maxY));
+
+        AddX(launcherBounds.Left, 4);
+        AddY(launcherBounds.Top);
+        AddY(minY);
+        AddY(maxY);
+
+        foreach (var preview in previews)
+        {
+            var right = (long)preview.Right + gap;
+            var left = (long)preview.Left - gap - launcherBounds.Width;
+            var canFitRight = launcherBounds.Width <= workArea.Width && right >= minX && right <= maxX;
+            var canFitLeft = launcherBounds.Width <= workArea.Width && left >= minX && left <= maxX;
+            var rightRoom = (long)workArea.Right - right;
+            var leftRoom = left - workArea.Left;
+
+            if (canFitRight)
+                AddX(right, 0);
+            if (canFitLeft)
+                AddX(left, 1);
+
+            var rightRank = canFitRight ? 0 : canFitLeft ? 2 : rightRoom >= leftRoom ? 2 : 3;
+            var leftRank = canFitLeft ? 1 : canFitRight ? 3 : leftRoom > rightRoom ? 2 : 3;
+            AddX(right, rightRank);
+            AddX(left, leftRank);
+            AddX((long)preview.Left - launcherBounds.Width, 3);
+            AddX(preview.Right, 2);
+
+            AddY(preview.Top);
+            AddY((long)preview.Bottom - launcherBounds.Height);
+        }
+
+        AvoidancePlacement? best = null;
+        var bestOverlap = long.MaxValue;
+        var bestSideRank = int.MaxValue;
+        var bestMovement = long.MaxValue;
+        foreach (var (x, sideRank) in xOptions)
+        {
+            foreach (var y in yOptions)
+            {
+                var candidate = new PixelsRect(x, y, SaturatingAdd(x, launcherBounds.Width), SaturatingAdd(y, launcherBounds.Height));
+                var overlap = previews.Sum(preview => IntersectionArea(candidate, preview));
+                var movement = Math.Abs((long)x - launcherBounds.Left) + Math.Abs((long)y - launcherBounds.Top);
+                if (overlap > bestOverlap
+                    || overlap == bestOverlap && sideRank > bestSideRank
+                    || overlap == bestOverlap && sideRank == bestSideRank && movement >= bestMovement)
+                {
+                    continue;
+                }
+
+                var within = launcherBounds.Width <= workArea.Width
+                    && launcherBounds.Height <= workArea.Height
+                    && candidate.Left >= workArea.Left
+                    && candidate.Top >= workArea.Top
+                    && candidate.Right <= workArea.Right
+                    && candidate.Bottom <= workArea.Bottom;
+                best = new AvoidancePlacement(x, y, overlap, within, sideRank);
+                bestOverlap = overlap;
+                bestSideRank = sideRank;
+                bestMovement = movement;
+            }
+        }
+
+        return best;
+    }
+
+    private static bool Intersects(PixelsRect first, PixelsRect second) =>
+        first.Left < second.Right && first.Right > second.Left && first.Top < second.Bottom && first.Bottom > second.Top;
+
+    private static long IntersectionArea(PixelsRect first, PixelsRect second)
+    {
+        var width = Math.Max(0L, Math.Min((long)first.Right, second.Right) - Math.Max((long)first.Left, second.Left));
+        var height = Math.Max(0L, Math.Min((long)first.Bottom, second.Bottom) - Math.Max((long)first.Top, second.Top));
+        return width * height;
+    }
+
+    private static int ClampPosition(long value, long minimum, long maximum) =>
+        (int)Math.Clamp(value, minimum, maximum);
+
+    private static int SaturatingAdd(int value, int amount) =>
+        (int)Math.Clamp((long)value + amount, int.MinValue, int.MaxValue);
+
     /// <summary>Work area (in device pixels) of the monitor under the cursor.</summary>
     public static PixelsRect GetCursorWorkArea() => SampleCursorMonitor().WorkArea;
+
+    /// <summary>Samples a window's monitor without falling back to a cursor/primary monitor.</summary>
+    internal static bool TrySampleWindowMonitor(IntPtr window, out MonitorSample sample)
+    {
+        if (window == IntPtr.Zero || !NativeMethods.IsWindow(window))
+        {
+            sample = default;
+            return false;
+        }
+
+        var monitor = NativeMethods.MonitorFromWindow(window, NativeMethods.MonitorDefaultToNearest);
+        if (monitor == IntPtr.Zero)
+        {
+            sample = default;
+            return false;
+        }
+
+        var info = new NativeMethods.MonitorInfo { cbSize = Marshal.SizeOf<NativeMethods.MonitorInfo>() };
+        if (!NativeMethods.GetMonitorInfoW(monitor, ref info)
+            || info.rcWork.Right <= info.rcWork.Left
+            || info.rcWork.Bottom <= info.rcWork.Top)
+        {
+            sample = default;
+            return false;
+        }
+
+        sample = new MonitorSample(
+            new PixelsRect(info.rcWork.Left, info.rcWork.Top, info.rcWork.Right, info.rcWork.Bottom),
+            GetMonitorDpiScale(monitor));
+        return true;
+    }
+
+    /// <summary>Captures the desktop id of the launcher's current virtual desktop using the public shell API.</summary>
+    internal static Guid? TryGetWindowDesktopId(IntPtr window, TimeSpan? timeout = null)
+    {
+        if (window == IntPtr.Zero)
+            return null;
+
+        var outcome = BoundedStaCall.Run(
+            () => NativeMethods.TryGetWindowDesktopId(window, out var id) ? (Guid?)id : null,
+            timeout ?? TimeSpan.FromMilliseconds(300),
+            "R1ng virtual desktop capture");
+        return outcome.Completed ? outcome.Value : null;
+    }
 
     /// <summary>
     /// Samples the monitor under the cursor: its work area in device pixels (negative coordinates and
@@ -146,6 +308,17 @@ public static class ScreenPlacement
         y,
         0,
         0,
+        NativeMethods.SwpNoSize | NativeMethods.SwpNoZOrder | NativeMethods.SwpNoActivate | NativeMethods.SwpAsyncWindowPos
+    );
+
+    /// <summary>Synchronously moves our own window on its dispatcher thread without size, z-order or activation changes.</summary>
+    internal static bool TryMoveOwnWindow(IntPtr handle, int x, int y) => NativeMethods.SetWindowPos(
+        handle,
+        IntPtr.Zero,
+        x,
+        y,
+        0,
+        0,
         NativeMethods.SwpNoSize | NativeMethods.SwpNoZOrder | NativeMethods.SwpNoActivate
     );
 
@@ -181,6 +354,12 @@ public static class ScreenPlacement
         }
 
         return 1.0;
+    }
+
+    /// <summary>Result of the best-effort own-window avoidance placement, all dimensions in device pixels.</summary>
+    public readonly record struct AvoidancePlacement(int X, int Y, long OverlapArea, bool WithinWorkArea, int SideRank)
+    {
+        public bool IsClear => OverlapArea == 0;
     }
 
     /// <summary>A monitor work area in device pixels and the scale (1.0 = 96 DPI) it renders at.</summary>

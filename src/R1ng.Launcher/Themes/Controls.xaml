@@ -3,18 +3,102 @@
 
     <!--
         Theme-aware control chrome for surfaces WPF would otherwise draw with system colours:
-        tooltips, context menus and the theme dropdown. Brushes are all DynamicResource so they
+        tooltips, scrollbars and context menus. Brushes are all DynamicResource so they
         follow the swappable palette in ThemeManager.
     -->
+
+    <!-- An overlay reserves no layout space and never intercepts clicks. Hover only changes its stroke. -->
+    <Style x:Key="HoverOutlineStyle" TargetType="Border">
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="IsHitTestVisible" Value="False" />
+        <Setter Property="SnapsToDevicePixels" Value="True" />
+        <Style.Triggers>
+            <MultiDataTrigger>
+                <MultiDataTrigger.Conditions>
+                    <Condition Binding="{Binding IsMouseOver, RelativeSource={RelativeSource TemplatedParent}}" Value="True" />
+                    <Condition Binding="{Binding IsEnabled, RelativeSource={RelativeSource TemplatedParent}}" Value="True" />
+                </MultiDataTrigger.Conditions>
+                <Setter Property="BorderBrush" Value="{DynamicResource HoverBorderBrush}" />
+            </MultiDataTrigger>
+        </Style.Triggers>
+    </Style>
 
     <Style TargetType="ToolTip">
         <Setter Property="Background" Value="{DynamicResource DropdownBackgroundBrush}" />
         <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-        <Setter Property="BorderBrush" Value="{DynamicResource DropdownBorderBrush}" />
-        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
         <Setter Property="Padding" Value="8,5" />
         <Setter Property="FontSize" Value="11.5" />
     </Style>
+
+    <!-- Keep the native ScrollViewer contract and virtualization; only replace scrollbar chrome. -->
+    <ControlTemplate x:Key="ThinScrollTrackButtonTemplate" TargetType="RepeatButton">
+        <Border Background="Transparent" />
+    </ControlTemplate>
+
+    <ControlTemplate x:Key="ThinScrollThumbTemplate" TargetType="Thumb">
+        <Grid>
+            <Border x:Name="ThumbBorder" Background="{DynamicResource TextMutedBrush}" CornerRadius="3" />
+            <Border x:Name="ThumbOutline" CornerRadius="3" Style="{StaticResource HoverOutlineStyle}" />
+        </Grid>
+        <ControlTemplate.Triggers>
+            <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="ThumbBorder" Property="Background" Value="{DynamicResource AccentBrush}" />
+            </Trigger>
+        </ControlTemplate.Triggers>
+    </ControlTemplate>
+
+    <Style x:Key="ThinScrollBarStyle" TargetType="ScrollBar">
+        <Setter Property="Width" Value="6" />
+        <Setter Property="Height" Value="Auto" />
+        <Setter Property="MinWidth" Value="0" />
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Focusable" Value="False" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ScrollBar">
+                    <Border Background="{TemplateBinding Background}">
+                        <Track x:Name="PART_Track" Orientation="{TemplateBinding Orientation}"
+                               Minimum="{TemplateBinding Minimum}" Maximum="{TemplateBinding Maximum}"
+                               Value="{TemplateBinding Value}" ViewportSize="{TemplateBinding ViewportSize}"
+                               IsDirectionReversed="True">
+                            <Track.DecreaseRepeatButton>
+                                <RepeatButton x:Name="DecreaseButton" Command="ScrollBar.PageUpCommand" Focusable="False"
+                                              Template="{StaticResource ThinScrollTrackButtonTemplate}" />
+                            </Track.DecreaseRepeatButton>
+                            <Track.Thumb>
+                                <Thumb x:Name="ScrollThumb" MinHeight="18" Template="{StaticResource ThinScrollThumbTemplate}" />
+                            </Track.Thumb>
+                            <Track.IncreaseRepeatButton>
+                                <RepeatButton x:Name="IncreaseButton" Command="ScrollBar.PageDownCommand" Focusable="False"
+                                              Template="{StaticResource ThinScrollTrackButtonTemplate}" />
+                            </Track.IncreaseRepeatButton>
+                        </Track>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="Orientation" Value="Horizontal">
+                            <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False" />
+                            <Setter TargetName="DecreaseButton" Property="Command" Value="ScrollBar.PageLeftCommand" />
+                            <Setter TargetName="IncreaseButton" Property="Command" Value="ScrollBar.PageRightCommand" />
+                            <Setter TargetName="ScrollThumb" Property="MinHeight" Value="0" />
+                            <Setter TargetName="ScrollThumb" Property="MinWidth" Value="18" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="Orientation" Value="Horizontal">
+                <Setter Property="Width" Value="Auto" />
+                <Setter Property="Height" Value="6" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <Style TargetType="ScrollBar" BasedOn="{StaticResource ThinScrollBarStyle}" />
 
     <!--
         Context menu chrome. The default ContextMenu template reserves an icon gutter (a grey strip
@@ -31,7 +115,10 @@
     </ControlTemplate>
 
     <ControlTemplate x:Key="MenuScrollThumbTemplate" TargetType="Thumb">
-        <Border Background="{DynamicResource TextMutedBrush}" CornerRadius="3" />
+        <Grid>
+            <Border x:Name="ThumbBorder" Background="{DynamicResource TextMutedBrush}" CornerRadius="3" />
+            <Border CornerRadius="3" Style="{StaticResource HoverOutlineStyle}" />
+        </Grid>
     </ControlTemplate>
 
     <Style x:Key="MenuScrollBarStyle" TargetType="ScrollBar">
@@ -85,8 +172,8 @@
     <Style TargetType="ContextMenu">
         <Setter Property="Background" Value="{DynamicResource DropdownBackgroundBrush}" />
         <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-        <Setter Property="BorderBrush" Value="{DynamicResource DropdownBorderBrush}" />
-        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
         <Setter Property="Padding" Value="4" />
         <Setter Property="SnapsToDevicePixels" Value="True" />
         <Setter Property="MaxHeight" Value="{Binding Height, Source={x:Static SystemParameters.WorkArea}, Mode=OneTime}" />
@@ -124,30 +211,33 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="MenuItem">
-                    <Border x:Name="MenuBorder"
-                            Background="{TemplateBinding Background}"
-                            CornerRadius="4"
-                            Padding="{TemplateBinding Padding}"
-                            SnapsToDevicePixels="True">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <ContentPresenter Grid.Column="0"
-                                              ContentSource="Header"
-                                              RecognizesAccessKey="True"
-                                              VerticalAlignment="Center" />
-                            <TextBlock Grid.Column="1"
-                                       Text="{TemplateBinding InputGestureText}"
-                                       Margin="18,0,0,0"
-                                       Opacity="0.6"
-                                       VerticalAlignment="Center" />
-                        </Grid>
-                    </Border>
+                    <Grid>
+                        <Border x:Name="MenuBorder"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}"
+                                SnapsToDevicePixels="True">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ContentPresenter Grid.Column="0"
+                                                  ContentSource="Header"
+                                                  RecognizesAccessKey="True"
+                                                  VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1"
+                                           Text="{TemplateBinding InputGestureText}"
+                                           Margin="18,0,0,0"
+                                           Opacity="0.6"
+                                           VerticalAlignment="Center" />
+                            </Grid>
+                        </Border>
+                        <Border x:Name="MenuOutline" CornerRadius="4" Style="{StaticResource HoverOutlineStyle}" />
+                    </Grid>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsHighlighted" Value="True">
-                            <Setter TargetName="MenuBorder" Property="Background" Value="{DynamicResource DropdownHoverBackgroundBrush}" />
+                            <Setter TargetName="MenuOutline" Property="BorderBrush" Value="{DynamicResource HoverBorderBrush}" />
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter Property="Opacity" Value="0.5" />
@@ -181,6 +271,7 @@
     <Style TargetType="Separator" BasedOn="{StaticResource {x:Static MenuItem.SeparatorStyleKey}}" />
 
     <Style TargetType="ComboBox">
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
         <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
         <Setter Property="FontSize" Value="11" />
         <Setter Property="Height" Value="24" />
@@ -191,8 +282,7 @@
                         <Border x:Name="Chrome"
                                 CornerRadius="6"
                                 Background="{DynamicResource FooterButtonBackgroundBrush}"
-                                BorderBrush="{DynamicResource FooterButtonBorderBrush}"
-                                BorderThickness="1">
+                                BorderThickness="0">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" />
@@ -221,6 +311,7 @@
                                            Foreground="{DynamicResource TextMutedBrush}" />
                             </Grid>
                         </Border>
+                        <Border x:Name="ComboOutline" CornerRadius="6" Style="{StaticResource HoverOutlineStyle}" />
                         <ToggleButton Background="Transparent"
                                       BorderThickness="0"
                                       Focusable="False"
@@ -240,8 +331,7 @@
                                PopupAnimation="Fade">
                             <Border x:Name="DropdownPanel"
                                     Background="{DynamicResource DropdownBackgroundBrush}"
-                                    BorderBrush="{DynamicResource DropdownBorderBrush}"
-                                    BorderThickness="1"
+                                    BorderThickness="0"
                                     CornerRadius="6"
                                     MinWidth="{TemplateBinding ActualWidth}"
                                     Margin="0,2,0,0">
@@ -252,8 +342,8 @@
                         </Popup>
                     </Grid>
                     <ControlTemplate.Triggers>
-                        <Trigger Property="IsMouseOver" Value="True">
-                            <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                        <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                            <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ChipHoverBackgroundBrush}" />
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -267,16 +357,19 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="ComboBoxItem">
-                    <Border x:Name="ItemBorder"
-                            Background="Transparent"
-                            CornerRadius="4"
-                            Padding="{TemplateBinding Padding}"
-                            SnapsToDevicePixels="True">
-                        <ContentPresenter />
-                    </Border>
+                    <Grid>
+                        <Border x:Name="ItemBorder"
+                                Background="Transparent"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}"
+                                SnapsToDevicePixels="True">
+                            <ContentPresenter />
+                        </Border>
+                        <Border x:Name="ItemOutline" CornerRadius="4" Style="{StaticResource HoverOutlineStyle}" />
+                    </Grid>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsHighlighted" Value="True">
-                            <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource DropdownHoverBackgroundBrush}" />
+                            <Setter TargetName="ItemOutline" Property="BorderBrush" Value="{DynamicResource HoverBorderBrush}" />
                         </Trigger>
                         <Trigger Property="IsSelected" Value="True">
                             <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource DropdownSelectedBackgroundBrush}" />

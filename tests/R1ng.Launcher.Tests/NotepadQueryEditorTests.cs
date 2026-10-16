@@ -47,9 +47,11 @@ public sealed class NotepadQueryEditorTests : IDisposable
         public Channel<QueryEditorSaved> Saved { get; } = Channel.CreateUnbounded<QueryEditorSaved>();
 
         public Channel<QueryEditorError> Failed { get; } = Channel.CreateUnbounded<QueryEditorError>();
+
+        public Channel<QueryEditorClosed> Closed { get; } = Channel.CreateUnbounded<QueryEditorClosed>();
     }
 
-    private Harness Create(TimeSpan? poll = null, Func<string, bool>? launch = null)
+    private Harness Create(TimeSpan? poll = null, Func<string, bool>? launch = null, INotepadTabTracker? tabTracker = null)
     {
         var harness = new Harness();
         var editor = new NotepadQueryEditor(
@@ -59,9 +61,11 @@ public sealed class NotepadQueryEditorTests : IDisposable
                 harness.Launches.Enqueue(path);
                 return launch?.Invoke(path) ?? true;
             },
-            poll ?? Fast);
+            poll ?? Fast,
+            tabTracker);
         editor.Saved += saved => harness.Saved.Writer.TryWrite(saved);
         editor.Failed += error => harness.Failed.Writer.TryWrite(error);
+        editor.Closed += closed => harness.Closed.Writer.TryWrite(closed);
         harness.Editor = editor;
         _editors.Add(editor);
         return harness;
@@ -77,6 +81,22 @@ public sealed class NotepadQueryEditorTests : IDisposable
     {
         await Task.Delay(milliseconds);
         Assert.False(channel.Reader.TryRead(out _), "no notification was expected");
+    }
+
+    private sealed class FakeTabTracker : INotepadTabTracker
+    {
+        public NotepadTabSnapshot Snapshot { get; set; } = new(true, Array.Empty<IntPtr>());
+
+        public Dictionary<IntPtr, NotepadWindowState> WindowStates { get; } = new();
+
+        public Guid DefaultDesktopId { get; } = Guid.NewGuid();
+
+        public NotepadWindowState InspectWindow(IntPtr window) => WindowStates.TryGetValue(window, out var state)
+            ? state
+            : new NotepadWindowState(NotepadWindowLife.Alive, false, NotepadWindowVisibility.Visible, DefaultDesktopId);
+
+        public NotepadTabSnapshot FindDraftTabs(string draftPath) => Snapshot;
+
     }
 
     private static void SaveInEditor(string path, string text) =>
@@ -422,6 +442,225 @@ public sealed class NotepadQueryEditorTests : IDisposable
         SaveInEditor(path, "back again");
 
         Assert.Equal("back again", (await NextAsync(harness.Saved)).Text);
+    }
+
+    [Theory]
+    [InlineData("unchanged", "unchanged")]
+    [InlineData("unsaved UI text", "")]
+    [InlineData("old", "last saved")]
+    public async Task Closing_the_matching_tab_reports_stable_saved_file_text_even_when_unchanged_or_empty(string initialText, string finalSavedText)
+    {
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var context = new QueryEditorLaunchContext(Guid.NewGuid());
+        tracker.WindowStates[new IntPtr(42)] = new NotepadWindowState(NotepadWindowLife.Alive, false, NotepadWindowVisibility.Visible, context.VirtualDesktopId);
+        var started = await harness.Editor.StartAsync(initialText, context);
+        var path = harness.Editor.DraftPath!;
+
+        if (!string.Equals(initialText, finalSavedText, StringComparison.Ordinal))
+            SaveInEditor(path, finalSavedText);
+
+        // Prove ownership through the unique draft-tab match, without manipulating its host window.
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { new IntPtr(42) });
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+
+        // A different Notepad tab/window disappearing does not affect the matching draft tab.
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { new IntPtr(42) });
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync(); // first reliable absence
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        await harness.Editor.RefreshAsync(); // second absence and a stable final read
+
+        Assert.Equal(new QueryEditorClosed(started.SessionId, finalSavedText), await NextAsync(harness.Closed));
+        Assert.True(File.Exists(path), "the closed draft remains available for recovery");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Observing_draft_windows_never_reports_placement_warnings_and_keeps_saving(bool desktopKnown)
+    {
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var context = desktopKnown ? new QueryEditorLaunchContext(tracker.DefaultDesktopId) : null;
+        await harness.Editor.StartAsync("draft", context);
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { new IntPtr(77) });
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Failed.Reader.TryRead(out _));
+
+        // A reused host or tab rehosting is observation only; neither triggers placement or its notices.
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { new IntPtr(88) });
+        await harness.Editor.RefreshAsync();
+        SaveInEditor(harness.Editor.DraftPath!, "still monitored");
+        await harness.Editor.RefreshAsync();
+
+        Assert.False(harness.Failed.Reader.TryRead(out _));
+        Assert.Equal("still monitored", (await NextAsync(harness.Saved)).Text);
+        Assert.True(File.Exists(harness.Editor.DraftPath));
+    }
+
+    [Fact]
+    public async Task Unreliable_scan_with_destroyed_old_host_does_not_close_rehosted_draft()
+    {
+        var oldWindow = new IntPtr(89);
+        var newWindow = new IntPtr(92);
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var started = await harness.Editor.StartAsync("last saved");
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { oldWindow });
+        await harness.Editor.RefreshAsync();
+
+        tracker.WindowStates[oldWindow] = new NotepadWindowState(NotepadWindowLife.Destroyed, false, NotepadWindowVisibility.Unknown, null);
+        tracker.Snapshot = new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+
+        // A partial but positive match proves the draft was rehosted; retain ownership of the new HWND.
+        tracker.Snapshot = new NotepadTabSnapshot(false, new[] { newWindow });
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+
+        // Only consecutive complete scans with no replacement tab can now complete the session.
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        await harness.Editor.RefreshAsync();
+        Assert.Equal(new QueryEditorClosed(started.SessionId, "last saved"), await NextAsync(harness.Closed));
+    }
+
+    [Theory]
+    [InlineData((int)NotepadWindowVisibility.Hidden)]
+    [InlineData((int)NotepadWindowVisibility.Cloaked)]
+    [InlineData((int)NotepadWindowVisibility.Unknown)]
+    public async Task Invisible_cloaked_or_unobservable_host_never_counts_as_tab_close(int visibility)
+    {
+        var window = new IntPtr(90);
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var started = await harness.Editor.StartAsync("draft");
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { window });
+        await harness.Editor.RefreshAsync();
+        tracker.WindowStates[window] = new NotepadWindowState(
+            NotepadWindowLife.Alive, false, (NotepadWindowVisibility)visibility, tracker.DefaultDesktopId);
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+
+        for (var i = 0; i < 3; i++)
+            await harness.Editor.RefreshAsync();
+
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+    }
+
+    [Fact]
+    public async Task Inconclusive_ui_automation_scan_resets_the_absence_debounce()
+    {
+        var window = new IntPtr(93);
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var started = await harness.Editor.StartAsync("draft");
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { window });
+        await harness.Editor.RefreshAsync();
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+        tracker.Snapshot = new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        await harness.Editor.RefreshAsync();
+        Assert.Equal(new QueryEditorClosed(started.SessionId, "draft"), await NextAsync(harness.Closed));
+    }
+
+    [Fact]
+    public async Task Missing_or_minimized_host_does_not_close_session_and_tracking_warning_is_one_shot()
+    {
+        var window = new IntPtr(90);
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var context = new QueryEditorLaunchContext(tracker.DefaultDesktopId);
+        var started = await harness.Editor.StartAsync("draft", context);
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { window });
+        await harness.Editor.RefreshAsync();
+        tracker.WindowStates[window] = new NotepadWindowState(
+            NotepadWindowLife.Alive, true, NotepadWindowVisibility.Visible, context.VirtualDesktopId);
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+
+        for (var i = 0; i < 22; i++)
+            await harness.Editor.RefreshAsync();
+
+        var warning = await NextAsync(harness.Failed);
+        Assert.Contains("自动关闭", warning.Message);
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        Assert.False(harness.Failed.Reader.TryRead(out _));
+        SaveInEditor(harness.Editor.DraftPath!, "still recoverable");
+        await harness.Editor.RefreshAsync();
+        Assert.Equal("still recoverable", (await NextAsync(harness.Saved)).Text);
+    }
+
+    [Fact]
+    public async Task Tab_never_observed_warns_after_grace_but_keeps_saving_the_recoverable_draft()
+    {
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var started = await harness.Editor.StartAsync("draft");
+
+        for (var i = 0; i < 22; i++)
+            await harness.Editor.RefreshAsync();
+
+        Assert.Contains("自动关闭", (await NextAsync(harness.Failed)).Message);
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+        Assert.False(harness.Failed.Reader.TryRead(out _));
+        SaveInEditor(harness.Editor.DraftPath!, "still monitored");
+        await harness.Editor.RefreshAsync();
+        Assert.Equal("still monitored", (await NextAsync(harness.Saved)).Text);
+    }
+
+    [Fact]
+    public async Task Absence_on_another_virtual_desktop_does_not_end_the_session()
+    {
+        var window = new IntPtr(91);
+        var targetDesktop = Guid.NewGuid();
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        var context = new QueryEditorLaunchContext(targetDesktop);
+        var started = await harness.Editor.StartAsync("draft", context);
+        tracker.WindowStates[window] = new NotepadWindowState(NotepadWindowLife.Alive, false, NotepadWindowVisibility.Visible, targetDesktop);
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { window });
+        await harness.Editor.RefreshAsync();
+
+        tracker.WindowStates[window] = new NotepadWindowState(NotepadWindowLife.Alive, false, NotepadWindowVisibility.Visible, Guid.NewGuid());
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        for (var i = 0; i < 22; i++)
+            await harness.Editor.RefreshAsync();
+
+        Assert.Contains("自动关闭", (await NextAsync(harness.Failed)).Message);
+        Assert.Equal(started.SessionId, harness.Editor.CurrentSessionId);
+        Assert.False(harness.Closed.Reader.TryRead(out _));
+    }
+
+    [Fact]
+    public async Task Ending_a_session_before_the_tab_disappears_suppresses_stale_close_callbacks()
+    {
+        var tracker = new FakeTabTracker();
+        var harness = Create(Idle, tabTracker: tracker);
+        await harness.Editor.StartAsync("still here");
+
+        tracker.Snapshot = new NotepadTabSnapshot(true, new[] { new IntPtr(9) });
+        await harness.Editor.RefreshAsync();
+        harness.Editor.EndSession();
+        tracker.Snapshot = new NotepadTabSnapshot(true, Array.Empty<IntPtr>());
+        await harness.Editor.RefreshAsync();
+
+        Assert.False(harness.Closed.Reader.TryRead(out _));
     }
 
     [Fact]

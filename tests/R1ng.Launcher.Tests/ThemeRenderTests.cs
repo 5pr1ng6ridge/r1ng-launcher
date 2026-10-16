@@ -1,7 +1,7 @@
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
+using System.Windows.Automation;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -13,19 +13,17 @@ using R1ng.Launcher.ViewModels;
 namespace R1ng.Launcher.Tests;
 
 /// <summary>
-/// Drives the real theme selector and the real production control chrome on an STA thread. Both the
-/// palette and <c>Themes/Controls.xaml</c> (the implicit styles App.xaml merges for tooltips,
-/// context menus and the theme dropdown) are installed into the window's own resource scope — never
-/// the user's settings — so the test validates the actual templated ComboBox chrome, not WPF's
-/// native default, and proves it follows the <c>DynamicResource</c> palette swap. The selector is
-/// driven through its real <c>ComboBox.SelectedValue</c>, the choice must persist to a temp settings
-/// file, and accurate dark/light frames (with a result sample) are rendered offscreen for review. No
-/// window is shown, no hotkey is registered and no foreground is taken.
+/// Drives the real icon-only theme button and production control chrome on an STA thread. The palette
+/// and <c>Themes/Controls.xaml</c> (the implicit styles App.xaml merges for context menus and tooltips)
+/// are installed into the window's own resource scope — never the user's settings. The test proves
+/// the button toggles live <c>DynamicResource</c> palettes, persists through the injected store,
+/// exposes an automation name without any tooltip and renders dark/light frames offscreen. No window
+/// is shown, no hotkey is registered and no foreground is taken.
 /// </summary>
 public class ThemeRenderTests
 {
     [Fact]
-    public async Task The_theme_selector_updates_live_dynamic_resources_and_persists_to_a_temp_settings_file()
+    public async Task The_icon_theme_button_toggles_live_dynamic_resources_and_persists_without_a_tooltip()
     {
         var settingsFile = Path.Combine(Path.GetTempPath(), "r1ng-theme-" + Guid.NewGuid().ToString("N") + ".json");
         var artifactDirectory = FindRepoArtifactDirectory();
@@ -55,15 +53,13 @@ public class ThemeRenderTests
                     new EmptyHistoryProvider(),
                     dispatcher,
                     initialTheme: AppTheme.Dark,
-                    applyTheme: applyTheme
+                    applyTheme: applyTheme,
+                    previewService: new LauncherActionTests.FakePreviewService()
                 );
 
                 window = new MainWindow(viewModel);
 
-                // App is never created in a test, so the control chrome from App.xaml ->
-                // Themes/Controls.xaml is merged into the window scope explicitly. Without it the
-                // ComboBox would fall back to the white native chrome, which is exactly the artifact
-                // defect this harness must not hide.
+                // App is never created in a test, so production control styles are merged explicitly.
                 LoadProductionControlStyles(window.Resources);
                 ThemeManager.Apply(AppTheme.Dark, window.Resources);
                 SeedResultSample(viewModel);
@@ -72,19 +68,19 @@ public class ThemeRenderTests
                 Layout(window);
 
                 AssertPalette(window, AppTheme.Dark);
-                AssertTemplatedChrome(window, AppTheme.Dark);
+                AssertThemeToggle(window, AppTheme.Dark);
                 Render(window, artifactDirectory, "r1ng-launcher-dark.png");
 
-                // Drive the actual footer selector, not the view-model setter: the real TwoWay
-                // SelectedValue binding goes through the apply seam.
-                window.ThemeSelector.SelectedValue = AppTheme.Light;
+                // Drive the actual theme button command; it applies and persists through the same seam.
+                window.ThemeToggleButton.Command.Execute(null);
+                window.ThemeToggleButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent, window.ThemeToggleButton));
                 Layout(window);
                 RefreshBindings(window);
                 Layout(window);
 
                 Assert.Equal(AppTheme.Light, viewModel.Theme);
                 AssertPalette(window, AppTheme.Light);
-                AssertTemplatedChrome(window, AppTheme.Light);
+                AssertThemeToggle(window, AppTheme.Light);
                 Render(window, artifactDirectory, "r1ng-launcher-light.png");
 
                 Assert.True(File.Exists(settingsFile), "the theme choice must be persisted");
@@ -147,37 +143,16 @@ public class ThemeRenderTests
         AssertBrush(palette, "AccentBrush", window.SearchBox.SelectionBrush);
     }
 
-    /// <summary>
-    /// The theme ComboBox must use the production template (its named <c>Chrome</c> border) and its
-    /// chrome, label text and dropdown panel must all resolve to the active palette through
-    /// DynamicResource. The closed selection box must also show the localized display name — the
-    /// real rendered 深色/浅色 label, not just the view-model property or the raw ThemeOption record.
-    /// </summary>
-    private static void AssertTemplatedChrome(MainWindow window, AppTheme theme)
+    private static void AssertThemeToggle(MainWindow window, AppTheme theme)
     {
-        var palette = ThemePalette.Create(theme);
-        var selector = window.ThemeSelector;
-        selector.ApplyTemplate();
-
-        var chrome = selector.Template.FindName("Chrome", selector) as Border;
-        Assert.NotNull(chrome);
-        AssertBrush(palette, "FooterButtonBackgroundBrush", chrome!.Background);
-        AssertBrush(palette, "FooterButtonBorderBrush", chrome.BorderBrush);
-        AssertBrush(palette, "TextSecondaryBrush", selector.Foreground);
-
-        var panel = selector.Template.FindName("DropdownPanel", selector) as Border;
-        Assert.NotNull(panel);
-        AssertBrush(palette, "DropdownBackgroundBrush", panel!.Background);
-        AssertBrush(palette, "DropdownBorderBrush", panel.BorderBrush);
-
-        // DisplayMemberPath must survive the custom template: the selection ContentPresenter needs
-        // the DisplayMember template selector, and the rendered TextBlock must be the display name.
-        var selectionBox = FindDescendant<ContentPresenter>(chrome);
-        Assert.NotNull(selectionBox);
-        Assert.NotNull(selectionBox!.ContentTemplateSelector);
-        var label = FindDescendant<TextBlock>(selectionBox);
-        Assert.NotNull(label);
-        Assert.Equal(theme == AppTheme.Light ? "浅色" : "深色", label!.Text);
+        var button = window.ThemeToggleButton;
+        Assert.Null(button.ToolTip);
+        Assert.Null(ToolTipService.GetToolTip(button));
+        Assert.Equal(theme == AppTheme.Dark ? "\uE706" : "\uE708", button.Content);
+        Assert.Equal(theme == AppTheme.Dark ? "切换到浅色主题" : "切换到深色主题", AutomationProperties.GetName(button));
+        Assert.IsType<Style>(button.Style);
+        Assert.Equal(30, button.Width);
+        Assert.Equal(30, button.Height);
     }
 
     private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
@@ -196,19 +171,12 @@ public class ThemeRenderTests
         return null;
     }
 
-    /// <summary>
-    /// Pulls the selector's ItemsSource/SelectedValue bindings to their source values explicitly so
-    /// the closed box reflects the view model even offscreen (an unshown window does not run the
-    /// normal Loaded-time binding flush).
-    /// </summary>
+    /// <summary>Refreshes the button's icon and automation-name bindings in an unshown window.</summary>
     private static void RefreshBindings(MainWindow window)
     {
-        var selector = window.ThemeSelector;
-
-        // Push pending DataBind work first, then re-pull both bindings.
         window.Dispatcher.Invoke(DispatcherPriority.DataBind, new Action(() => { }));
-        selector.GetBindingExpression(ItemsControl.ItemsSourceProperty)?.UpdateTarget();
-        selector.GetBindingExpression(Selector.SelectedValueProperty)?.UpdateTarget();
+        window.ThemeToggleButton.GetBindingExpression(ContentControl.ContentProperty)?.UpdateTarget();
+        window.ThemeToggleButton.GetBindingExpression(AutomationProperties.NameProperty)?.UpdateTarget();
     }
 
     private static void AssertBrush(ResourceDictionary palette, string key, Brush? actual)
@@ -298,7 +266,7 @@ public class ThemeRenderTests
         window.UpdateLayout();
 
         // An unshown Window does not measure its content by itself; measure/arrange the content tree
-        // explicitly so templates (including the ComboBox selection box) are realized for assertions.
+        // explicitly so templates (including the icon button) are realized for assertions.
         if (window.Content is FrameworkElement content)
         {
             content.Measure(available);

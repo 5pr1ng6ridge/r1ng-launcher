@@ -143,6 +143,107 @@ public class ScreenPlacementTests
     }
 
     [Fact]
+    public void Preview_avoidance_prefers_the_right_when_both_sides_fit()
+    {
+        var launcher = new ScreenPlacement.PixelsRect(450, 100, 750, 500);
+        var preview = new ScreenPlacement.PixelsRect(800, 100, 1100, 600);
+        var workArea = new ScreenPlacement.PixelsRect(0, 0, 1600, 900);
+
+        var placement = ScreenPlacement.PlaceBeside(launcher, [preview], workArea);
+
+        Assert.NotNull(placement);
+        Assert.Equal((1116, 100), (placement.Value.X, placement.Value.Y));
+        Assert.True(placement.Value.IsClear);
+        Assert.True(placement.Value.WithinWorkArea);
+    }
+
+    [Fact]
+    public void Preview_avoidance_uses_the_left_when_the_right_does_not_fit()
+    {
+        var launcher = new ScreenPlacement.PixelsRect(100, 100, 500, 500);
+        var preview = new ScreenPlacement.PixelsRect(800, 100, 1000, 500);
+        var workArea = new ScreenPlacement.PixelsRect(0, 0, 1200, 800);
+
+        var placement = ScreenPlacement.PlaceBeside(launcher, [preview], workArea);
+
+        Assert.NotNull(placement);
+        Assert.Equal((384, 100), (placement.Value.X, placement.Value.Y));
+        Assert.True(placement.Value.IsClear);
+    }
+
+    [Fact]
+    public void Preview_avoidance_keeps_negative_mixed_dpi_coordinates_in_device_pixels()
+    {
+        var workArea = new ScreenPlacement.PixelsRect(-1920, -200, 0, 880);
+        var launcher = new ScreenPlacement.PixelsRect(-700, 0, -200, 400);
+        var preview = new ScreenPlacement.PixelsRect(-800, 0, -300, 500);
+
+        var placement = ScreenPlacement.PlaceBeside(launcher, [preview], workArea);
+
+        Assert.NotNull(placement);
+        Assert.Equal((-1316, 0), (placement.Value.X, placement.Value.Y));
+        Assert.True(placement.Value.WithinWorkArea);
+        Assert.Equal(500, launcher.Width);
+        Assert.Equal(400, launcher.Height);
+    }
+
+    [Fact]
+    public void Preview_avoidance_minimizes_overlap_when_the_total_width_cannot_fit()
+    {
+        var workArea = new ScreenPlacement.PixelsRect(0, 0, 1000, 800);
+        var launcher = new ScreenPlacement.PixelsRect(100, 100, 500, 500);
+        var preview = new ScreenPlacement.PixelsRect(50, 100, 650, 500);
+
+        var placement = ScreenPlacement.PlaceBeside(launcher, [preview], workArea);
+
+        Assert.NotNull(placement);
+        Assert.Equal(600, placement.Value.X);
+        Assert.Equal(5_000, placement.Value.OverlapArea);
+        Assert.False(placement.Value.IsClear);
+        Assert.True(placement.Value.WithinWorkArea);
+    }
+
+    [Fact]
+    public void Preview_avoidance_selects_a_clear_gap_that_avoids_multiple_pinned_windows()
+    {
+        var workArea = new ScreenPlacement.PixelsRect(0, 0, 1600, 800);
+        var launcher = new ScreenPlacement.PixelsRect(600, 100, 1000, 500);
+        var previews = new[]
+        {
+            new ScreenPlacement.PixelsRect(100, 100, 500, 500),
+            new ScreenPlacement.PixelsRect(1100, 100, 1500, 500),
+        };
+
+        var placement = ScreenPlacement.PlaceBeside(launcher, previews, workArea);
+
+        Assert.NotNull(placement);
+        Assert.Equal(516, placement.Value.X);
+        Assert.True(placement.Value.IsClear);
+    }
+
+    [Fact]
+    public void Preview_avoidance_returns_no_move_when_no_visible_preview_was_found()
+    {
+        Assert.Null(ScreenPlacement.PlaceBeside(
+            new ScreenPlacement.PixelsRect(100, 100, 500, 500),
+            Array.Empty<ScreenPlacement.PixelsRect>(),
+            new ScreenPlacement.PixelsRect(0, 0, 1000, 800)));
+    }
+
+    [Fact]
+    public void Preview_avoidance_clamps_an_oversized_launcher_and_reports_partial_containment()
+    {
+        var placement = ScreenPlacement.PlaceBeside(
+            new ScreenPlacement.PixelsRect(0, 0, 400, 300),
+            [new ScreenPlacement.PixelsRect(120, 20, 220, 120)],
+            new ScreenPlacement.PixelsRect(-100, -50, 200, 150));
+
+        Assert.NotNull(placement);
+        Assert.Equal((-100, -50), (placement.Value.X, placement.Value.Y));
+        Assert.False(placement.Value.WithinWorkArea);
+    }
+
+    [Fact]
     public void The_fallback_work_area_is_the_primary_screen_in_real_pixels()
     {
         var fallback = ScreenPlacement.FallbackWorkArea();

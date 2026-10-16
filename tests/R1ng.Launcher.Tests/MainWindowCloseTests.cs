@@ -17,7 +17,7 @@ public class MainWindowCloseTests
     public async Task A_user_close_hides_the_window_and_only_an_explicit_shutdown_closes_it()
     {
         Exception? failure = null;
-        var outcome = new TaskCompletionSource<(bool ClosedAfterUserRequest, bool ClosedAfterShutdown)>(
+        var outcome = new TaskCompletionSource<(bool ClosedAfterUserRequest, bool ClosedAfterShutdown, int TrayDisposedAfterHide, int TrayDisposeCount)>(
             TaskCreationOptions.RunContinuationsAsynchronously
         );
 
@@ -29,27 +29,31 @@ public class MainWindowCloseTests
                 using var viewModel = new LauncherViewModel(
                     new SearchController(new EmptyAppProvider(), new EmptyFileProvider()),
                     new EmptyHistoryProvider(),
-                    dispatcher
+                    dispatcher,
+                    previewService: new LauncherActionTests.FakePreviewService()
                 );
 
-                var window = new MainWindow(viewModel);
+                var tray = new TestLauncherTrayIcon();
+                var window = new MainWindow(viewModel, tray);
+                window.Initialize(registerHotKeys: false);
                 var closed = false;
                 window.Closed += (_, _) => closed = true;
 
-                // Alt+F4 / a normal close request must not dispose the hotkey or release the guard.
+                // Alt+F4 / a normal close request hides the window but must keep the tray icon alive.
                 window.Close();
                 var closedAfterUserRequest = closed;
+                var trayDisposedAfterHide = tray.DisposeCalls;
 
                 // Session end allows the close so the process can actually exit.
                 window.AllowClose();
                 window.Close();
 
-                outcome.SetResult((closedAfterUserRequest, closed));
+                outcome.SetResult((closedAfterUserRequest, closed, trayDisposedAfterHide, tray.DisposeCalls));
             }
             catch (Exception exception)
             {
                 failure = exception;
-                outcome.TrySetResult((false, false));
+                outcome.TrySetResult((false, false, -1, -1));
             }
         })
         {
@@ -64,9 +68,11 @@ public class MainWindowCloseTests
             await outcome.Task.WaitAsync(TimeSpan.FromSeconds(20));
             Assert.Null(failure);
 
-            var (closedAfterUserRequest, closedAfterShutdown) = await outcome.Task;
+            var (closedAfterUserRequest, closedAfterShutdown, trayDisposedAfterHide, trayDisposeCount) = await outcome.Task;
             Assert.False(closedAfterUserRequest, "a user close must hide the window, not close it");
+            Assert.Equal(0, trayDisposedAfterHide);
             Assert.True(closedAfterShutdown, "an explicit shutdown must be able to close the window");
+            Assert.Equal(1, trayDisposeCount);
         }
         finally
         {
@@ -90,15 +96,18 @@ public class MainWindowCloseTests
                 using var viewModel = new LauncherViewModel(
                     new SearchController(new EmptyAppProvider(), new EmptyFileProvider()),
                     new EmptyHistoryProvider(),
-                    dispatcher
+                    dispatcher,
+                    previewService: new LauncherActionTests.FakePreviewService()
                 );
 
                 var shutdown = new RecordingShutdown();
-                var window = new MainWindow(viewModel, shutdown);
+                var tray = new TestLauncherTrayIcon();
+                var window = new MainWindow(viewModel, tray, shutdown);
+                window.Initialize(registerHotKeys: false);
                 var closed = false;
                 window.Closed += (_, _) => closed = true;
 
-                // The footer “退出” command goes through RequestQuit -> Quit (AllowClose + shutdown).
+                // The injected tray Quit command goes through RequestQuit -> Quit (AllowClose + shutdown).
                 viewModel.QuitCommand.Execute(null);
 
                 // A close after an explicit quit must really close instead of hiding like Alt+F4.

@@ -32,6 +32,10 @@ public partial class MainWindow : Window
     /// Bounded so a misbehaving DPI notification can never turn into an endless move loop.
     /// </summary>
     private const int MaxPlacementCorrections = 3;
+    private const int MaxQuickLookAvoidanceAttempts = 12;
+    private static readonly TimeSpan QuickLookAvoidanceRetryDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan QuickLookDiscoveryTimeout = TimeSpan.FromMilliseconds(200);
+    private const int QuickLookAvoidanceGap = 16;
 
     private static int _openContextMenus;
 
@@ -40,11 +44,26 @@ public partial class MainWindow : Window
     private readonly IApplicationShutdown _applicationShutdown;
     private readonly Func<IntPtr, string?> _resolveExplorerFolder;
     private readonly IQueryEditor _queryEditor;
+    private readonly Func<string, bool> _copyTextToClipboard;
+    private readonly ILauncherTrayIcon _trayIcon;
+    private readonly ILauncherNoticePresenter _noticePresenter;
+    private DispatcherOperation? _noticeDispatch;
+    private string? _pendingNoticeProperty;
+    private ResultItemViewModel? _lastMousePreviewItem;
+    private readonly IQuickLookWindowLocator _quickLookWindowLocator;
+    private readonly ILauncherWindowPlacement _launcherWindowPlacement;
+    private readonly Func<TimeSpan, CancellationToken, Task> _quickLookAvoidanceDelay;
     private readonly CancellationTokenSource _lifetime = new();
     private GlobalHotKey? _hotKey;
     private HwndSource? _source;
     private bool _allowClose;
     private bool _closed;
+    private bool _trayIconAvailable;
+    private bool _trayInitializationAttempted;
+    private string? _trayFailureMessage;
+    private string _hotKeySummary = "未注册";
+    private string? _hotKeyNotice;
+    private bool _hotKeyFailure;
 
     // Modal dialogs (the hidden-items manager) that own the keyboard; they suppress the focus-loss hide
     // separately from open context menus and are always released in a finally block.
@@ -60,6 +79,7 @@ public partial class MainWindow : Window
     private long _latestSequence;
     private string? _pendingSavedText;
     private readonly Dictionary<Guid, QueryEditorSaved> _earlySaves = new();
+    private readonly Dictionary<Guid, QueryEditorClosed> _earlyClosures = new();
     private bool _startingEditor;
 
     private static readonly char[] LineBreaks = ['\r', '\n'];
@@ -71,6 +91,10 @@ public partial class MainWindow : Window
     private int _placementCorrectionsLeft;
     private DispatcherOperation? _placementCorrection;
     private DispatcherOperation? _selectionScroll;
+    private CancellationTokenSource? _quickLookAvoidanceCancellation;
+    private QuickLookRequestAnchor? _quickLookRequestAnchor;
+    private QuickLookAvoidanceLayout? _quickLookAvoidanceLayout;
+    private long _latestQuickLookPlacementGeneration;
 
     static MainWindow()
     {
@@ -90,7 +114,25 @@ public partial class MainWindow : Window
         LauncherViewModel viewModel,
         IApplicationShutdown? applicationShutdown = null,
         Func<IntPtr, string?>? explorerFolderResolver = null,
-        IQueryEditor? queryEditor = null
+        IQueryEditor? queryEditor = null,
+        Func<string, bool>? copyTextToClipboard = null
+    ) : this(viewModel, new LauncherTrayIcon(), applicationShutdown, explorerFolderResolver, queryEditor, copyTextToClipboard)
+    {
+    }
+
+    internal MainWindow(
+        LauncherViewModel viewModel,
+        ILauncherTrayIcon trayIcon,
+        IApplicationShutdown? applicationShutdown = null,
+        Func<IntPtr, string?>? explorerFolderResolver = null,
+        IQueryEditor? queryEditor = null,
+        Func<string, bool>? copyTextToClipboard = null,
+        IQuickLookWindowLocator? quickLookWindowLocator = null,
+        ILauncherWindowPlacement? launcherWindowPlacement = null,
+        Func<TimeSpan, CancellationToken, Task>? quickLookAvoidanceDelay = null,
+        ILauncherNoticePresenter? noticePresenter = null,
+        IGraceTimer? deactivationTimer = null,
+        Func<bool>? launcherIsActive = null
     )
     {
         _viewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
@@ -99,6 +141,18 @@ public partial class MainWindow : Window
 
         // The window owns the editor: it is disposed in OnClosed (the user's notepad is not closed).
         _queryEditor = queryEditor ?? new NotepadQueryEditor();
+        _copyTextToClipboard = copyTextToClipboard ?? TryCopyTextToClipboard;
+        _trayIcon = trayIcon ?? throw new ArgumentNullException(nameof(trayIcon));
+        _noticePresenter = noticePresenter ?? (Application.Current is null
+            ? new NullLauncherNoticePresenter() : new LauncherNoticePresenter());
+        _quickLookWindowLocator = quickLookWindowLocator ?? new QuickLookWindowLocator();
+        _launcherWindowPlacement = launcherWindowPlacement ?? new Win32LauncherWindowPlacement();
+        _quickLookAvoidanceDelay = quickLookAvoidanceDelay ?? ((delay, token) => Task.Delay(delay, token));
+        _trayIcon.ShowRequested += OnTrayShowRequested;
+        _trayIcon.ManageHiddenRequested += OnTrayManageHiddenRequested;
+        _trayIcon.QuitRequested += OnTrayQuitRequested;
+        _trayIcon.AvailabilityChanged += OnTrayAvailabilityChanged;
+        SampleEditorContext = queryEditor is null ? CaptureEditorContext : () => null;
         HiddenWindowPresenter = PresentHiddenWindow;
         InitializeComponent();
 
@@ -107,24 +161,29 @@ public partial class MainWindow : Window
         _viewModel.RequestHide += HideLauncher;
         _viewModel.RequestQuit += Quit;
         _viewModel.RequestManageHidden += OnRequestManageHidden;
+        _viewModel.QuickLookPlacementRequestStarted += OnQuickLookPlacementRequestStarted;
+        _viewModel.QuickLookPlacementRequestCompleted += OnQuickLookPlacementRequestCompleted;
         _queryEditor.Saved += OnEditorSaved;
         _queryEditor.Failed += OnEditorFailed;
+        _queryEditor.Closed += OnEditorClosed;
         PreviewKeyDown += OnPreviewKeyDown;
         Deactivated += OnDeactivated;
-        ThemeSelector.DropDownClosed += OnThemeDropDownClosed;
         ResultsList.PreviewMouseLeftButtonDown += OnResultsPreviewMouseLeftButtonDown;
         DataObject.AddPastingHandler(SearchBox, OnSearchBoxPasting);
 
         _deactivationGrace = new DeactivationGrace(
-            new DispatcherGraceTimer(Dispatcher, TimeSpan.FromMilliseconds(GracePeriodMs)),
-            shouldHide: () => IsVisible && !IsActive,
+            deactivationTimer ?? new DispatcherGraceTimer(Dispatcher, TimeSpan.FromMilliseconds(GracePeriodMs)),
+            shouldHide: () => IsVisible && !(launcherIsActive?.Invoke() ?? IsActive),
             isSuppressed: () => IsDeactivationSuppressed,
-            hide: HideLauncher
+            hide: HideAfterDeactivation
         );
     }
 
     /// <summary>Samples the monitor to place on; replaceable so tests can pin a work area.</summary>
     internal Func<ScreenPlacement.MonitorSample> SampleMonitor { get; set; } = ScreenPlacement.SampleCursorMonitor;
+
+    /// <summary>Captures desktop identity for conservative draft-close detection, never for positioning Notepad.</summary>
+    internal Func<QueryEditorLaunchContext?> SampleEditorContext { get; set; }
 
     /// <summary>Reads the keyboard modifiers; replaceable so tests can drive Ctrl shortcuts without real input.</summary>
     internal Func<ModifierKeys> ModifierProvider { get; set; } = () => Keyboard.Modifiers;
@@ -157,36 +216,69 @@ public partial class MainWindow : Window
     /// <summary>False when the independent Ctrl + Alt + Space file shortcut could not be registered.</summary>
     public bool FileHotKeyAvailable { get; private set; }
 
-    /// <summary>Creates the window handle, registers the hotkey and hooks window messages.</summary>
-    /// <returns><c>true</c> when a hotkey is active; <c>false</c> when both combinations failed.</returns>
-    public bool Initialize()
+    /// <summary>False when the notification-area icon could not be installed.</summary>
+    public bool TrayIconAvailable => _trayIconAvailable;
+
+    /// <summary>Creates the window handle, tray icon, hotkeys and native-message hook.</summary>
+    /// <returns><c>true</c> when the launcher hotkey is active.</returns>
+    public bool Initialize() => Initialize(registerHotKeys: true);
+
+    /// <summary>Injectable initialization seam: tests can exercise tray callbacks without registering hotkeys.</summary>
+    internal bool Initialize(bool registerHotKeys)
     {
         var handle = new WindowInteropHelper(this).EnsureHandle();
         _source = HwndSource.FromHwnd(handle);
         _source?.AddHook(WindowMessageHook);
 
-        _hotKey = new GlobalHotKey(handle);
-        var registered = _hotKey.RegisterLauncher(HotKeyDefinition.AltSpace, HotKeyDefinition.CtrlShiftSpace);
-        var fileRegistered = _hotKey.RegisterFileHotKey(HotKeyDefinition.CtrlAltSpace);
+        try
+        {
+            _trayIconAvailable = _trayIcon.Initialize(handle);
+        }
+        catch (Exception exception)
+        {
+            _trayIconAvailable = false;
+            _trayFailureMessage = exception.Message;
+        }
+        _trayInitializationAttempted = true;
+        if (_trayIconAvailable)
+            _trayFailureMessage = null;
+        else
+            _trayFailureMessage ??= _trayIcon.FailureMessage;
 
-        var status = HotKeyRegistrationStatus.WithFileHotKey(
-            HotKeyRegistrationStatus.From(registered, _hotKey.Active, _hotKey.FailureMessage),
-            fileRegistered,
-            _hotKey.FileActive,
-            _hotKey.FileFailureMessage
-        );
+        var registered = false;
+        var fileRegistered = false;
+        HotKeyRegistrationStatus? status = null;
+        if (registerHotKeys)
+        {
+            _hotKey = new GlobalHotKey(handle);
+            registered = _hotKey.RegisterLauncher(HotKeyDefinition.AltSpace, HotKeyDefinition.CtrlShiftSpace);
+            fileRegistered = _hotKey.RegisterFileHotKey(HotKeyDefinition.CtrlAltSpace);
+            status = HotKeyRegistrationStatus.WithFileHotKey(
+                HotKeyRegistrationStatus.From(registered, _hotKey.Active, _hotKey.FailureMessage),
+                fileRegistered,
+                _hotKey.FileActive,
+                _hotKey.FileFailureMessage
+            );
+            HotKeyStatus = status.Value.Summary;
+        }
+        else
+        {
+            HotKeyStatus = "快捷键未在测试中注册";
+        }
+
         HotKeyAvailable = registered;
         FileHotKeyAvailable = fileRegistered;
-        HotKeyStatus = status.Summary;
-        _viewModel.SetHotKeyStatus(status.Notice, status.IsFailure);
+        _hotKeySummary = HotKeyStatus;
+        _hotKeyNotice = status?.Notice;
+        _hotKeyFailure = status?.IsFailure ?? false;
+        RefreshTrayNotice();
 
         return registered;
     }
 
     /// <summary>
     /// Explicitly exits the resident launcher. Allows the close to proceed and shuts the application
-    /// down, which closes the window and releases the hotkey and the single-instance guard (through
-    /// <see cref="App.OnExit"/> and <see cref="OnClosed"/>). Bound to the footer “退出” button.
+    /// down, which closes the window and releases the tray icon, hotkeys and single-instance guard.
     /// </summary>
     public void Quit()
     {
@@ -229,7 +321,16 @@ public partial class MainWindow : Window
     /// </summary>
     public void HideLauncher()
     {
+        if (_trayInitializationAttempted && !_trayIconAvailable && !HotKeyAvailable)
+        {
+            // With neither recovery route available, hiding would leave a resident single-instance
+            // process that cannot be shown again. Keep the diagnostic window visible; Alt+F4 exits.
+            _viewModel.SetActionNotice("系统托盘与快捷键均不可用，窗口保持显示；按 Alt+F4 退出。");
+            return;
+        }
+
         _deactivationGrace.Cancel();
+        CancelQuickLookAvoidance(resetLayout: true);
         EndPlacement();
 
         // A modal manager window must not outlive the launcher's own hide.
@@ -280,6 +381,30 @@ public partial class MainWindow : Window
     /// </summary>
     internal static bool IsSameForegroundWindow(IntPtr captured, IntPtr current) =>
         captured != IntPtr.Zero && captured == current;
+
+    private QueryEditorLaunchContext CaptureEditorContext()
+    {
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == IntPtr.Zero)
+            handle = new WindowInteropHelper(this).EnsureHandle();
+
+        return new QueryEditorLaunchContext(ScreenPlacement.TryGetWindowDesktopId(handle));
+    }
+
+    private static bool TryCopyTextToClipboard(string text)
+    {
+        try
+        {
+            var data = new DataObject();
+            data.SetData(DataFormats.UnicodeText, text ?? string.Empty);
+            Clipboard.SetDataObject(data, copy: true);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
 
     /// <summary>Resolves the folder for a captured handle through the injected resolver seam.</summary>
     internal string? ResolveExplorerFolder(IntPtr windowHandle) => _resolveExplorerFolder(windowHandle);
@@ -346,6 +471,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void PositionOnCursorMonitor()
     {
+        CancelQuickLookAvoidance(resetLayout: true);
         var sample = SampleMonitor();
         _workArea = sample.WorkArea;
         _placementCorrectionsLeft = MaxPlacementCorrections;
@@ -375,6 +501,25 @@ public partial class MainWindow : Window
         if (widthChanged && IsVisible)
             QueuePlacementCorrection();
         var maxHeightPixels = (int)Math.Round(maxHeight * dpiScale);
+        if (_quickLookAvoidanceLayout is { } avoidance)
+        {
+            if (_launcherWindowPlacement.TryCapture(handle, out var current)
+                && current.Handle == handle
+                && current.Monitor.WorkArea == avoidance.WorkArea)
+            {
+                var reference = new ScreenPlacement.PixelsRect(
+                    current.Bounds.Left,
+                    current.Bounds.Top,
+                    SaturatingPixelAdd(current.Bounds.Left, widthPixels),
+                    SaturatingPixelAdd(current.Bounds.Top, maxHeightPixels));
+                TryPlaceBesideQuickLook(handle, reference, avoidance.PreviewBounds, avoidance.WorkArea, requestGeneration: null, out _);
+            }
+
+            // A monitor/DPI transition invalidates the captured avoidance anchor. Do not silently
+            // re-center over the preview; the next explicit show samples a fresh monitor.
+            return;
+        }
+
         var (x, y) = ScreenPlacement.Place(widthPixels, maxHeightPixels, workArea);
 
         if (ScreenPlacement.TryGetWindowBounds(handle, out var bounds) && bounds.Left == x && bounds.Top == y)
@@ -400,7 +545,7 @@ public partial class MainWindow : Window
         _placementCorrection = Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(CorrectPlacement));
     }
 
-    private void CorrectPlacement()
+    internal void CorrectPlacement()
     {
         _placementCorrection = null;
         var handle = new WindowInteropHelper(this).Handle;
@@ -420,6 +565,205 @@ public partial class MainWindow : Window
         _placementCorrection = null;
     }
 
+    private void OnQuickLookPlacementRequestStarted(long generation)
+    {
+        _lastMousePreviewItem = null;
+        CancelQuickLookAvoidance(resetLayout: false);
+        _latestQuickLookPlacementGeneration = generation;
+        if (_closed || !IsVisible)
+            return;
+
+        var handle = new WindowInteropHelper(this).Handle;
+        if (_launcherWindowPlacement.TryCapture(handle, out var snapshot) && snapshot.Handle == handle)
+            _quickLookRequestAnchor = new QuickLookRequestAnchor(generation, snapshot);
+    }
+
+    private void OnQuickLookPlacementRequestCompleted(long generation)
+    {
+        if (!IsCurrentQuickLookRequest(generation, out var anchor))
+            return;
+
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _quickLookAvoidanceCancellation = cancellation;
+        _ = FindAndAvoidQuickLookAsync(generation, anchor, cancellation);
+    }
+
+    private async Task FindAndAvoidQuickLookAsync(
+        long generation,
+        QuickLookRequestAnchor anchor,
+        CancellationTokenSource cancellation)
+    {
+        ScreenPlacement.AvoidancePlacement? lastPlacement = null;
+        try
+        {
+            for (var attempt = 0; attempt < MaxQuickLookAvoidanceAttempts; attempt++)
+            {
+                var token = cancellation.Token;
+                if (attempt > 0)
+                    await _quickLookAvoidanceDelay(QuickLookAvoidanceRetryDelay, token).ConfigureAwait(true);
+                if (token.IsCancellationRequested || !IsCurrentQuickLookRequest(generation, out var currentAnchor)
+                    || currentAnchor.Snapshot.Handle != anchor.Snapshot.Handle)
+                {
+                    return;
+                }
+
+                IReadOnlyList<QuickLookWindowCandidate> candidates;
+                var scan = _quickLookWindowLocator.FindVisiblePreviewsAsync(token);
+                try
+                {
+                    candidates = await scan.WaitAsync(QuickLookDiscoveryTimeout, token).ConfigureAwait(true);
+                }
+                catch (TimeoutException)
+                {
+                    ObserveLateFault(scan);
+                    continue;
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+
+                if (token.IsCancellationRequested || !IsCurrentQuickLookRequest(generation, out currentAnchor))
+                    return;
+
+                var previewBounds = candidates
+                    .Where(candidate => candidate.Handle != IntPtr.Zero)
+                    .Select(candidate => candidate.Bounds)
+                    .Where(bounds => bounds.Width > 0 && bounds.Height > 0)
+                    .Distinct()
+                    .ToArray();
+                if (previewBounds.Length == 0)
+                    continue;
+
+                if (TryPlaceBesideQuickLook(
+                    anchor.Snapshot.Handle,
+                    currentAnchor.Snapshot.Bounds,
+                    previewBounds,
+                    anchor.Snapshot.Monitor.WorkArea,
+                    generation,
+                    out var placement))
+                {
+                    lastPlacement = placement;
+                }
+            }
+
+            if (lastPlacement is { IsClear: false } || lastPlacement is { WithinWorkArea: false })
+            {
+                _viewModel.SetActionNotice("当前工作区无法完全并排显示 QuickLook 与启动器，已尽量减少重叠。");
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // Hiding, another request or shutdown cancels discovery before any later move.
+        }
+        catch (Exception)
+        {
+            // Preview avoidance is opportunistic; a discovery or placement failure must not block the UI.
+        }
+        finally
+        {
+            if (ReferenceEquals(_quickLookAvoidanceCancellation, cancellation))
+                _quickLookAvoidanceCancellation = null;
+            cancellation.Dispose();
+        }
+    }
+
+    private bool TryPlaceBesideQuickLook(
+        IntPtr expectedHandle,
+        ScreenPlacement.PixelsRect launcherBounds,
+        IReadOnlyList<ScreenPlacement.PixelsRect> previewBounds,
+        ScreenPlacement.PixelsRect workArea,
+        long? requestGeneration,
+        out ScreenPlacement.AvoidancePlacement placement)
+    {
+        placement = default;
+        if (_closed || !IsVisible || expectedHandle == IntPtr.Zero
+            || new WindowInteropHelper(this).Handle != expectedHandle
+            || requestGeneration is { } generation && !IsCurrentQuickLookRequest(generation, out _)
+            || !_launcherWindowPlacement.TryCapture(expectedHandle, out var current)
+            || current.Handle != expectedHandle
+            || current.Monitor.WorkArea != workArea)
+        {
+            return false;
+        }
+
+        var result = ScreenPlacement.PlaceBeside(launcherBounds, previewBounds, workArea, QuickLookAvoidanceGap);
+        if (result is not { } target)
+            return false;
+
+        var alreadyThere = current.Bounds.Left == target.X && current.Bounds.Top == target.Y;
+        if (!alreadyThere && !_launcherWindowPlacement.TryMove(expectedHandle, target.X, target.Y))
+            return false;
+
+        placement = target;
+        _quickLookAvoidanceLayout = new QuickLookAvoidanceLayout(workArea, previewBounds.ToArray());
+        return true;
+    }
+
+    private bool IsCurrentQuickLookRequest(long generation, out QuickLookRequestAnchor anchor)
+    {
+        anchor = default;
+        if (_closed || !IsVisible
+            || generation != _latestQuickLookPlacementGeneration
+            || _quickLookRequestAnchor is not { } captured
+            || captured.Generation != generation)
+        {
+            return false;
+        }
+
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == IntPtr.Zero
+            || handle != captured.Snapshot.Handle
+            || !_launcherWindowPlacement.TryCapture(handle, out var current)
+            || current.Handle != handle
+            || current.Monitor.WorkArea != captured.Snapshot.Monitor.WorkArea)
+        {
+            return false;
+        }
+
+        anchor = captured with { Snapshot = current };
+        _quickLookRequestAnchor = anchor;
+        return true;
+    }
+
+    private void CancelQuickLookAvoidance(bool resetLayout)
+    {
+        _quickLookRequestAnchor = null;
+        var cancellation = _quickLookAvoidanceCancellation;
+        _quickLookAvoidanceCancellation = null;
+        if (cancellation is not null)
+        {
+            try
+            {
+                cancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The bounded retry completed while cancellation was being requested.
+            }
+            cancellation.Dispose();
+        }
+
+        if (resetLayout)
+            _quickLookAvoidanceLayout = null;
+    }
+
+    private static void ObserveLateFault(Task task)
+    {
+        _ = task.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private static int SaturatingPixelAdd(int value, int offset) =>
+        (int)Math.Clamp((long)value + offset, int.MinValue, int.MaxValue);
+
     protected override void OnDpiChanged(DpiScale oldDpiScaleInfo, DpiScale newDpiScaleInfo)
     {
         base.OnDpiChanged(oldDpiScaleInfo, newDpiScaleInfo);
@@ -430,12 +774,60 @@ public partial class MainWindow : Window
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (_closed) return;
+        if (e.PropertyName is nameof(LauncherViewModel.ActionNotice) or nameof(LauncherViewModel.FileNotice)
+            or nameof(LauncherViewModel.HotKeyNotice))
+            QueueNotice(e.PropertyName);
+        else if (e.PropertyName == nameof(LauncherViewModel.Theme))
+            _noticePresenter.UpdateTheme(_viewModel.Theme);
         // Raised for every selection change and for a refresh that keeps the same index.
         if (e.PropertyName == nameof(LauncherViewModel.SelectedIndex))
+        {
+            _lastMousePreviewItem = null;
             QueueSelectionIntoView();
+        }
         else if (e.PropertyName == nameof(LauncherViewModel.Query))
+        {
+            _lastMousePreviewItem = null;
             _queryRevision++;
+        }
     }
+
+    private void QueueNotice(string property)
+    {
+        var message = NoticeMessage(property);
+        if (string.IsNullOrWhiteSpace(message)) return;
+        _pendingNoticeProperty = property;
+        if (_noticeDispatch is { Status: DispatcherOperationStatus.Pending }) return;
+        _noticeDispatch = Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            _noticeDispatch = null;
+            if (_closed || _pendingNoticeProperty is not { } kind) return;
+            _pendingNoticeProperty = null;
+            var text = NoticeMessage(kind);
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var handle = new WindowInteropHelper(this).Handle;
+            var monitor = ScreenPlacement.TrySampleWindowMonitor(handle, out var sampled) ? sampled : SampleMonitor();
+            var bounds = ScreenPlacement.TryGetWindowBounds(handle, out var measured) ? measured : monitor.WorkArea;
+            try
+            {
+                _noticePresenter.Show(new LauncherNotice(text, kind == nameof(LauncherViewModel.HotKeyNotice) && _viewModel.IsHotKeyFailure),
+                    new NoticeAnchor(bounds, monitor), _viewModel.Theme);
+            }
+            catch (Exception)
+            {
+                // A notification failure must never steal focus, block an action, or crash the launcher.
+            }
+        }));
+    }
+
+    private string? NoticeMessage(string property) => property switch
+    {
+        nameof(LauncherViewModel.ActionNotice) => _viewModel.ActionNotice,
+        nameof(LauncherViewModel.FileNotice) => _viewModel.FileNotice,
+        nameof(LauncherViewModel.HotKeyNotice) => _viewModel.HotKeyNotice,
+        _ => null,
+    };
 
     /// <summary>
     /// Brings the selected row into the bounded viewport. Deferred until the list has generated its
@@ -454,13 +846,30 @@ public partial class MainWindow : Window
     {
         _selectionScroll = null;
         var index = _viewModel.SelectedIndex;
-        if (index < 0 || index >= _viewModel.Results.Count)
+        if (index < 0)
             return;
 
-        // A refreshed first row must be at the very top even if the old rows were scrolled.
+        if (_viewModel.IsHomeQuery)
+        {
+            if (index == 0)
+                HomeScroll.ScrollToTop();
+            if (index < _viewModel.HomePins.Count)
+            {
+                (HomePinsList.ItemContainerGenerator.ContainerFromIndex(index) as FrameworkElement)?.BringIntoView();
+                return;
+            }
+
+            var historyIndex = index - _viewModel.HomePins.Count;
+            if (historyIndex < 0 || historyIndex >= _viewModel.Results.Count)
+                return;
+            (HomeHistoryList.ItemContainerGenerator.ContainerFromIndex(historyIndex) as FrameworkElement)?.BringIntoView();
+            return;
+        }
+
+        if (index >= _viewModel.Results.Count)
+            return;
         if (index == 0)
             FindDescendant<ScrollViewer>(ResultsList)?.ScrollToTop();
-
         ResultsList.ScrollIntoView(_viewModel.Results[index]);
     }
 
@@ -487,30 +896,116 @@ public partial class MainWindow : Window
         _deactivationGrace.NotifyDeactivated();
     }
 
-    private void OnThemeDropDownClosed(object? sender, EventArgs e)
+    /// <summary>Only accepted focus-loss hides close QuickLook; menus/dialogs and refused hides do not.</summary>
+    private void HideAfterDeactivation()
     {
-        if (!IsVisible || _allowClose)
-            return;
+        if (!IsVisible) return;
+        HideLauncher();
+        if (!IsVisible) _ = _viewModel.ClosePreviewAsync();
+    }
 
+    private void SelectAndFollowPreview(int index)
+    {
+        var before = _viewModel.SelectedItem;
+        _viewModel.SelectedIndex = index;
+        var selected = _viewModel.SelectedItem;
+        if (!ReferenceEquals(before, selected) || !ReferenceEquals(_lastMousePreviewItem, selected))
+        {
+            _viewModel.SwitchPreviewSelected();
+            _lastMousePreviewItem = selected;
+        }
+    }
+
+    private void OnPinnedTilePreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton == MouseButton.Left && sender is Button { DataContext: ResultItemViewModel item }
+            && _viewModel.HomePins.IndexOf(item) is var index && index >= 0)
+            SelectAndFollowPreview(index);
+    }
+
+    private void OnThemeToggleClick(object sender, RoutedEventArgs e)
+    {
         SearchBox.Focus();
         Keyboard.Focus(SearchBox);
     }
 
+    private void OnPinnedTileGotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (sender is Button { DataContext: ResultItemViewModel item }
+            && _viewModel.HomePins.IndexOf(item) is var index && index >= 0)
+            _viewModel.SelectedIndex = index;
+    }
+
+    private void OnPinnedTileClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { DataContext: ResultItemViewModel item })
+            return;
+        var index = _viewModel.HomePins.IndexOf(item);
+        if (index >= 0)
+            SelectAndFollowPreview(index);
+        item.OpenCommand.Execute(null);
+    }
+
+    private ResultItemViewModel? GetFocusedPinnedTile()
+    {
+        for (var current = Keyboard.FocusedElement as DependencyObject; current is not null; current = ParentOf(current))
+        {
+            if (current is Button { DataContext: ResultItemViewModel item } && _viewModel.HomePins.Contains(item))
+                return item;
+        }
+        return null;
+    }
+
+    private bool SelectFocusedPinnedTile(ResultItemViewModel item)
+    {
+        var index = _viewModel.HomePins.IndexOf(item);
+        if (index < 0)
+            return false;
+
+        _viewModel.SelectedIndex = index;
+        return true;
+    }
+
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
-        // Let open menus commit/cancel and navigate themselves, including Enter and Escape.
-        if (ThemeSelector.IsDropDownOpen || Volatile.Read(ref _openContextMenus) > 0)
+        if (Volatile.Read(ref _openContextMenus) > 0)
             return;
 
         var modifiers = ModifierProvider();
         var control = (modifiers & ModifierKeys.Control) == ModifierKeys.Control;
-
         // An active (Chinese) IME swallows Ctrl+Space and hands the key over as ImeProcessed, with the
         // real key in ImeProcessedKey. Only the two explicit Ctrl chords look through it: Enter, Esc,
         // Tab and the arrows must keep belonging to the IME while it is composing or choosing.
         var chordKey = e.Key == Key.ImeProcessed ? e.ImeProcessedKey : e.Key;
+        var focusedPinnedTile = GetFocusedPinnedTile();
+        var buttonKey = e.Key is Key.Enter or Key.Space;
+
+        // Keep native Space activation, but handle Enter explicitly: a non-default WPF Button
+        // does not promise Enter activation. Modified chords still reach the launcher below.
+        if (buttonKey && ThemeToggleButton.IsKeyboardFocusWithin)
+            return;
+        if (e.Key == Key.Enter && modifiers == ModifierKeys.None && focusedPinnedTile is not null)
+        {
+            if (SelectFocusedPinnedTile(focusedPinnedTile))
+                focusedPinnedTile.OpenCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
+        if (buttonKey && focusedPinnedTile is not null && modifiers != ModifierKeys.Control)
+            return;
+
+        if (focusedPinnedTile is not null && modifiers == ModifierKeys.Control && chordKey == Key.Space)
+            SelectFocusedPinnedTile(focusedPinnedTile);
         if (modifiers == ModifierKeys.Control && TryHandleControlChord(e, chordKey))
             return;
+
+        if (e.Key == Key.Enter && modifiers == ModifierKeys.Control && focusedPinnedTile is not null)
+        {
+            if (SelectFocusedPinnedTile(focusedPinnedTile))
+                focusedPinnedTile.OpenContainingFolderCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
 
         switch (e.Key)
         {
@@ -520,8 +1015,8 @@ public partial class MainWindow : Window
                 break;
 
             case Key.Tab:
-                // Only while the query box owns the keyboard, and never while the theme dropdown or a
-                // result context menu is up, so normal dialog navigation still works there.
+                // Only while the query box owns the keyboard, and never while a result context menu
+                // is up, so menu navigation is never hijacked.
                 if (ShouldCycleScope())
                 {
                     _viewModel.CycleScope((modifiers & ModifierKeys.Shift) == ModifierKeys.Shift);
@@ -530,13 +1025,21 @@ public partial class MainWindow : Window
 
                 break;
 
+            case Key.Right when ShouldNavigateHomeHorizontally(modifiers, focusedPinnedTile):
             case Key.Down when ShouldNavigateResults():
-                _viewModel.MoveSelection(1);
+                if (focusedPinnedTile is not null)
+                    SelectFocusedPinnedTile(focusedPinnedTile);
+                if (_viewModel.MoveSelection(1))
+                    _viewModel.SwitchPreviewSelected();
                 SyncNavigation(e);
                 break;
 
+            case Key.Left when ShouldNavigateHomeHorizontally(modifiers, focusedPinnedTile):
             case Key.Up when ShouldNavigateResults():
-                _viewModel.MoveSelection(-1);
+                if (focusedPinnedTile is not null)
+                    SelectFocusedPinnedTile(focusedPinnedTile);
+                if (_viewModel.MoveSelection(-1))
+                    _viewModel.SwitchPreviewSelected();
                 SyncNavigation(e);
                 break;
 
@@ -608,13 +1111,14 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Result navigation keys apply unless the theme dropdown or a result context menu is using them
-    /// (their own arrow/Home/End handling must keep working).
+    /// Result navigation keys apply unless a result context menu is using them.
     /// </summary>
-    private bool ShouldNavigateResults() =>
-        Volatile.Read(ref _openContextMenus) == 0
-        && !ThemeSelector.IsDropDownOpen
-        && !ThemeSelector.IsKeyboardFocusWithin;
+    private bool ShouldNavigateResults() => Volatile.Read(ref _openContextMenus) == 0;
+
+    /// <summary>Plain left/right navigate home only when they cannot edit query text.</summary>
+    private bool ShouldNavigateHomeHorizontally(ModifierKeys modifiers, ResultItemViewModel? focusedPinnedTile) =>
+        modifiers == ModifierKeys.None && _viewModel.ShowHomeTiles && ShouldNavigateResults()
+        && (SearchBox.IsKeyboardFocusWithin ? SearchBox.Text.Length == 0 : focusedPinnedTile is not null);
 
     /// <summary>
     /// Always re-syncs the viewport after a navigation key: at a boundary (Home on the first row after
@@ -622,6 +1126,18 @@ public partial class MainWindow : Window
     /// </summary>
     private void SyncNavigation(KeyEventArgs e)
     {
+        // A focused tile must follow selection, otherwise its Enter/Space action would still open
+        // the old tile. Entering history returns focus to the query box, without selecting its text.
+        if (GetFocusedPinnedTile() is not null)
+        {
+            var index = _viewModel.SelectedIndex;
+            if (_viewModel.IsHomeQuery && index >= 0 && index < _viewModel.HomePins.Count
+                && HomePinsList.ItemContainerGenerator.ContainerFromIndex(index) is DependencyObject container
+                && FindDescendant<Button>(container) is { } tile)
+                Keyboard.Focus(tile);
+            else
+                Keyboard.Focus(SearchBox);
+        }
         QueueSelectionIntoView();
         e.Handled = true;
     }
@@ -636,41 +1152,72 @@ public partial class MainWindow : Window
         return SearchBox.IsKeyboardFocusWithin;
     }
 
-    // ----- mouse: double-click opens the real row -------------------------------------------------
+    // ----- mouse: shared home scrolling and row activation -----------------------------------------
+
+    private void OnHomePreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        // Nested ScrollViewers (the horizontal pins and the disabled history viewport) otherwise
+        // swallow the wheel. Deliver it straight to the shared viewer using WPF's normal wheel step.
+        e.Handled = true;
+        HomeScroll.RaiseEvent(new MouseWheelEventArgs(e.MouseDevice, e.Timestamp, e.Delta)
+        {
+            RoutedEvent = Mouse.MouseWheelEvent,
+        });
+    }
 
     /// <summary>
-    /// Left double-click on a result row opens exactly that row through its own command (the same
-    /// open flow as Enter). The row comes from the element that was really hit, not from the
-    /// selection; blank list space, the scroll bar and every other mouse button do nothing.
+    /// A left click selects the hit row without taking focus from the query; a double-click also
+    /// opens that same row through its own command (the same open flow as Enter). Blank list space,
+    /// scroll bars and other mouse buttons do nothing.
     /// </summary>
     private void OnResultsPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (e.ClickCount != 2 || e.ChangedButton != MouseButton.Left)
-            return;
-        if (FindResultRow(e.OriginalSource as DependencyObject) is not { } row)
+        if (e.ChangedButton != MouseButton.Left
+            || FindResultRow(e.OriginalSource as DependencyObject, ResultsList) is not { } row)
             return;
 
-        e.Handled = true;
-        row.OpenCommand.Execute(null);
+        var index = _viewModel.Results.IndexOf(row);
+        if (index < 0)
+            return;
+        SelectAndFollowPreview(index);
+        if (e.ClickCount == 2)
+        {
+            e.Handled = true;
+            row.OpenCommand.Execute(null);
+        }
     }
 
-    private ResultItemViewModel? FindResultRow(DependencyObject? source)
+    private void OnHomeHistoryPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Left
+            || FindResultRow(e.OriginalSource as DependencyObject, HomeHistoryList) is not { } row)
+            return;
+
+        var index = _viewModel.Results.IndexOf(row);
+        if (index >= 0)
+            SelectAndFollowPreview(_viewModel.HomePins.Count + index);
+        if (e.ClickCount == 2)
+        {
+            e.Handled = true;
+            row.OpenCommand.Execute(null);
+        }
+    }
+
+    private static ResultItemViewModel? FindResultRow(DependencyObject? source, ListBox owner)
     {
         for (var current = source; current is not null; current = ParentOf(current))
         {
             if (current is ListBoxItem container)
             {
-                // A container of some other list (or a stale one) is not a row of this list.
-                if (!ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(container), ResultsList))
+                // A container of another list or a stale row is never treated as a launcher result.
+                if (!ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(container), owner))
                     return null;
-
-                return ResultsList.ItemContainerGenerator.ItemFromContainer(container) as ResultItemViewModel;
+                return owner.ItemContainerGenerator.ItemFromContainer(container) as ResultItemViewModel;
             }
 
-            if (ReferenceEquals(current, ResultsList))
+            if (ReferenceEquals(current, owner))
                 return null;
         }
-
         return null;
     }
 
@@ -786,7 +1333,7 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Starts a notepad edit of <paramref name="text"/>. Success hides the launcher; failure, a busy
-    /// start or an already running session leaves the input untouched and says why in the footer.
+    /// start or an already running session leaves the input untouched and shows an on-demand notice.
     /// </summary>
     internal async Task StartEditingAsync(string text)
     {
@@ -802,16 +1349,26 @@ public partial class MainWindow : Window
         // while the editor starts must keep winning over a later save.
         var revision = _queryRevision;
         var token = _lifetime.Token;
+        QueryEditorLaunchContext? launchContext;
+        try
+        {
+            launchContext = SampleEditorContext();
+        }
+        catch (Exception)
+        {
+            launchContext = null;
+        }
         _startingEditor = true;
 
         QueryEditorStartResult result;
         try
         {
-            result = await _queryEditor.StartAsync(text ?? string.Empty, token).ConfigureAwait(true);
+            result = await _queryEditor.StartAsync(text ?? string.Empty, launchContext, token).ConfigureAwait(true);
         }
         catch (OperationCanceledException)
         {
             _earlySaves.Clear();
+            _earlyClosures.Clear();
             if (!_closed)
                 _viewModel.SetActionNotice("记事本启动已取消，输入已保留");
             return;
@@ -819,6 +1376,7 @@ public partial class MainWindow : Window
         catch (Exception exception)
         {
             _earlySaves.Clear();
+            _earlyClosures.Clear();
             if (!_closed)
                 _viewModel.SetActionNotice($"无法启动记事本：{exception.Message}（输入已保留）");
             return;
@@ -834,6 +1392,7 @@ public partial class MainWindow : Window
         if (!result.Success)
         {
             _earlySaves.Clear();
+            _earlyClosures.Clear();
             var reason = string.IsNullOrWhiteSpace(result.Error) ? "未知原因" : result.Error;
             _viewModel.SetActionNotice($"无法启动记事本：{reason}（输入已保留）");
             return;
@@ -842,13 +1401,15 @@ public partial class MainWindow : Window
         if (_sessionId == result.SessionId)
         {
             _earlySaves.Clear();
-            _viewModel.SetActionNotice("已有进行中的记事本编辑，未创建新的编辑；可点底部“编辑中”结束编辑后重新开始");
+            _earlyClosures.Clear();
+            _viewModel.SetActionNotice("已有进行中的记事本编辑，未创建新的编辑；可点顶部“编辑中”结束编辑后重新开始");
             UpdateEditingIndicator();
             return;
         }
 
         BeginSession(result.SessionId, revision);
-        HideLauncher();
+        if (_sessionId == result.SessionId)
+            HideLauncher();
     }
 
     private void BeginSession(Guid sessionId, int revision)
@@ -860,11 +1421,15 @@ public partial class MainWindow : Window
 
         // A save that was queued before the start returned belongs to this session if the ids agree.
         _earlySaves.TryGetValue(sessionId, out var early);
+        _earlyClosures.TryGetValue(sessionId, out var earlyClosure);
         _earlySaves.Clear();
+        _earlyClosures.Clear();
         UpdateEditingIndicator();
 
         if (early is not null)
             HandleEditorSaved(early);
+        if (earlyClosure is not null)
+            HandleEditorClosed(earlyClosure);
     }
 
     private void ResetSession()
@@ -873,11 +1438,14 @@ public partial class MainWindow : Window
         _latestSequence = 0;
         _pendingSavedText = null;
         _earlySaves.Clear();
+        _earlyClosures.Clear();
     }
 
     private void OnEditorSaved(QueryEditorSaved saved) => PostToUi(() => HandleEditorSaved(saved));
 
     private void OnEditorFailed(QueryEditorError error) => PostToUi(() => HandleEditorFailed(error));
+
+    private void OnEditorClosed(QueryEditorClosed closed) => PostToUi(() => HandleEditorClosed(closed));
 
     /// <summary>Runs on the UI thread: inline when already there, otherwise queued in event order.</summary>
     private void PostToUi(Action action)
@@ -947,10 +1515,61 @@ public partial class MainWindow : Window
         else
         {
             _pendingSavedText = text;
-            _viewModel.SetActionNotice("记事本已保存新内容，但输入框已被修改，未覆盖；可在底部“编辑中”菜单应用已保存内容");
+            _viewModel.SetActionNotice("记事本已保存新内容，但输入框已被修改，未覆盖；可在顶部“编辑中”菜单应用已保存内容");
         }
 
         UpdateEditingIndicator();
+    }
+
+    internal void HandleEditorClosed(QueryEditorClosed closed)
+    {
+        if (_closed || closed is null)
+            return;
+
+        if (closed.SessionId != _sessionId)
+        {
+            // The tab can close as soon as Notepad appears, before StartAsync returns its session id.
+            if (_startingEditor
+                && (!_earlyClosures.TryGetValue(closed.SessionId, out var known)))
+            {
+                if (_earlyClosures.Count >= 8)
+                    _earlyClosures.Clear();
+                _earlyClosures[closed.SessionId] = closed;
+            }
+
+            return;
+        }
+
+        var savedText = closed.SavedText ?? string.Empty;
+        ResetSession();
+        UpdateEditingIndicator();
+
+        string? endFailure = null;
+        try
+        {
+            _queryEditor.EndSession();
+        }
+        catch (Exception exception)
+        {
+            endFailure = exception.Message;
+        }
+
+        bool copied;
+        try
+        {
+            copied = _copyTextToClipboard(savedText);
+        }
+        catch (Exception)
+        {
+            copied = false;
+        }
+
+        ShowLauncher();
+        _viewModel.SetActionNotice(copied
+            ? endFailure is null
+                ? "记事本草稿标签已关闭，最后保存的内容已复制到剪贴板"
+                : $"记事本标签已关闭，内容已复制；结束编辑时出错：{endFailure}"
+            : "记事本草稿标签已关闭，但复制到剪贴板失败；草稿文件仍已保留");
     }
 
     private void HandleEditorFailed(QueryEditorError error)
@@ -1067,7 +1686,7 @@ public partial class MainWindow : Window
             return;
 
         menu.PlacementTarget = EditingButton;
-        menu.Placement = PlacementMode.Top;
+        menu.Placement = PlacementMode.Bottom;
         menu.IsOpen = true;
     }
 
@@ -1075,8 +1694,71 @@ public partial class MainWindow : Window
 
     private void OnEndEditingClick(object sender, RoutedEventArgs e) => EndEditing();
 
+    private void OnTrayAvailabilityChanged(bool available, string? failureMessage)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            if (!_closed && !Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(new Action(() => OnTrayAvailabilityChanged(available, failureMessage)));
+            return;
+        }
+        if (_closed || !_trayInitializationAttempted)
+            return;
+
+        _trayIconAvailable = available;
+        _trayFailureMessage = available ? null : failureMessage ?? _trayIcon.FailureMessage;
+        RefreshTrayNotice();
+
+        // With no registered hotkey a hidden launcher would be unreachable once Explorer rejects the
+        // re-registration. Keep the diagnostic visible until the tray route is healthy or Alt+F4 exits.
+        if (!available && !HotKeyAvailable && !IsVisible)
+            ShowLauncher();
+    }
+
+    private void RefreshTrayNotice()
+    {
+        var notice = _hotKeyNotice;
+        var failure = _hotKeyFailure;
+        HotKeyStatus = _hotKeySummary;
+
+        if (!_trayIconAvailable)
+        {
+            var reason = _trayFailureMessage ?? _trayIcon.FailureMessage;
+            var trayNotice = $"系统托盘图标不可用：{(string.IsNullOrWhiteSpace(reason) ? "未知错误" : reason)}；窗口会保持显示，按 Alt+F4 退出。";
+            if (notice is not null)
+                notice = notice.Replace(HotKeyRegistrationStatus.UnavailableNotice, "系统托盘图标不可用时可按 Alt+F4 退出");
+            notice = string.IsNullOrEmpty(notice) ? trayNotice : $"{notice}；{trayNotice}";
+            failure = true;
+            HotKeyStatus = string.IsNullOrEmpty(HotKeyStatus) ? trayNotice : $"{HotKeyStatus}；{trayNotice}";
+        }
+
+        _viewModel.SetHotKeyStatus(notice, failure);
+    }
+
+    private void OnTrayShowRequested() => DispatchTrayAction(ShowLauncher);
+
+    private void OnTrayManageHiddenRequested() => DispatchTrayAction(() => _viewModel.ManageHiddenCommand.Execute(null));
+
+    private void OnTrayQuitRequested() => DispatchTrayAction(() => _viewModel.QuitCommand.Execute(null));
+
+    private void DispatchTrayAction(Action action)
+    {
+        if (_closed)
+            return;
+        if (Dispatcher.CheckAccess())
+            action();
+        else
+            _ = Dispatcher.BeginInvoke(action);
+    }
+
     private IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
+        if (_trayIcon.HandleWindowMessage(message, wParam, lParam))
+        {
+            handled = true;
+            return IntPtr.Zero;
+        }
+
         if (message == NativeMethods.WmHotKey)
         {
             // Dispatch by id so the independent file shortcut never toggles the launcher hide.
@@ -1099,34 +1781,67 @@ public partial class MainWindow : Window
         // process that could no longer be shown or started again. Only an explicit shutdown closes it.
         if (!_allowClose)
         {
-            e.Cancel = true;
-            HideLauncher();
-            return;
+            if (_trayInitializationAttempted && !_trayIconAvailable)
+            {
+                // Never trap a resident process with neither its tray escape route nor a working hotkey.
+                AllowClose();
+                _applicationShutdown.Shutdown();
+            }
+            else
+            {
+                e.Cancel = true;
+                HideLauncher();
+                return;
+            }
         }
 
         base.OnClosing(e);
     }
 
+    private readonly record struct QuickLookRequestAnchor(long Generation, LauncherWindowSnapshot Snapshot);
+
+    private readonly record struct QuickLookAvoidanceLayout(
+        ScreenPlacement.PixelsRect WorkArea,
+        IReadOnlyList<ScreenPlacement.PixelsRect> PreviewBounds);
+
     protected override void OnClosed(EventArgs e)
     {
         // First: any queued editor callback or pending start/refresh continuation sees a closed window.
         _closed = true;
+        _noticeDispatch?.Abort();
+        _noticePresenter.Dispose();
+        CancelQuickLookAvoidance(resetLayout: true);
         if (_hiddenDialog is { IsVisible: true } dialog)
             dialog.Close();
 
         Deactivated -= OnDeactivated;
-        ThemeSelector.DropDownClosed -= OnThemeDropDownClosed;
         ResultsList.PreviewMouseLeftButtonDown -= OnResultsPreviewMouseLeftButtonDown;
+        HomeHistoryList.PreviewMouseLeftButtonDown -= OnHomeHistoryPreviewMouseLeftButtonDown;
         DataObject.RemovePastingHandler(SearchBox, OnSearchBoxPasting);
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
         _viewModel.RequestHide -= HideLauncher;
         _viewModel.RequestQuit -= Quit;
         _viewModel.RequestManageHidden -= OnRequestManageHidden;
+        _viewModel.QuickLookPlacementRequestStarted -= OnQuickLookPlacementRequestStarted;
+        _viewModel.QuickLookPlacementRequestCompleted -= OnQuickLookPlacementRequestCompleted;
+        _trayIcon.ShowRequested -= OnTrayShowRequested;
+        _trayIcon.ManageHiddenRequested -= OnTrayManageHiddenRequested;
+        _trayIcon.QuitRequested -= OnTrayQuitRequested;
+        _trayIcon.AvailabilityChanged -= OnTrayAvailabilityChanged;
+        try
+        {
+            _trayIcon.Dispose();
+        }
+        catch (Exception)
+        {
+            // Native tray cleanup must not prevent the application from shutting down.
+        }
 
         // Stop the editor's callbacks and release it. Only the launcher's tracking ends here: the
         // user's notepad window and the draft file are not closed or deleted by the window.
         _queryEditor.Saved -= OnEditorSaved;
         _queryEditor.Failed -= OnEditorFailed;
+        _queryEditor.Closed -= OnEditorClosed;
         _lifetime.Cancel();
         try
         {

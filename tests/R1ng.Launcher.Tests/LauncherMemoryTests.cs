@@ -88,6 +88,44 @@ public sealed class LauncherMemoryTests : IDisposable
     }
 
     [Fact]
+    public void Mixed_application_file_and_folder_pins_keep_order_and_metadata_after_restart()
+    {
+        var now = DateTime.UtcNow;
+        var store = new SearchHistoryStore(HistoryPath, () => now);
+        var app = Item(1);
+        var file = Item(2) with
+        {
+            Kind = ResultKind.File, Target = @"C:\Docs\report.txt", FolderPath = @"C:\Docs",
+            IconPath = @"C:\Icons\report.ico", IconIndex = 3,
+        };
+        var folder = Item(3) with
+        {
+            Kind = ResultKind.Folder, IsFolder = true, Target = @"C:\Docs\Reports", FolderPath = @"C:\Docs\Reports",
+        };
+        Assert.True(store.TrySetPinned(app, true));
+        now = now.AddMinutes(1);
+        Assert.True(store.TrySetPinned(file, true));
+        now = now.AddMinutes(1);
+        Assert.True(store.TrySetPinned(folder, true));
+        now = now.AddMinutes(1);
+        store.Record(Item(4));
+
+        var reloaded = new SearchHistoryStore(HistoryPath);
+        Assert.Equal(new[] { folder.Target, file.Target, app.Target, Item(4).Target },
+            reloaded.GetHome(SearchScope.All, 60).Select(row => row.Target));
+        var fileRows = reloaded.GetHome(SearchScope.Files, 60);
+        Assert.Equal(new[] { folder.Target, file.Target }, fileRows.Select(row => row.Target));
+        Assert.True(fileRows[0].IsFolder);
+        Assert.Equal(file.IconPath, fileRows[1].IconPath);
+        Assert.Equal(file.IconIndex, fileRows[1].IconIndex);
+        Assert.Equal(file.FolderPath, fileRows[1].FolderPath);
+        Assert.All(fileRows, row => Assert.True(row.IsPinned));
+        Assert.True(reloaded.TrySetPinned(fileRows[1], false));
+        Assert.DoesNotContain(new SearchHistoryStore(HistoryPath).GetHome(SearchScope.All, 60),
+            row => row.Target == file.Target);
+    }
+
+    [Fact]
     public void Verified_shortcut_aliases_reconcile_legacy_history_without_title_matching()
     {
         var store = new SearchHistoryStore(HistoryPath);
@@ -276,9 +314,10 @@ public sealed class LauncherMemoryTests : IDisposable
         Assert.Empty(preferences.GetPreferences(row.Context));
         vm.Query = "";
         vm.Prime();
-        Assert.Null(vm.Results[0].Context);
+        var homeItem = Assert.Single(vm.HomePins);
+        Assert.Null(homeItem.Context);
         succeeds = true;
-        vm.Results[0].OpenCommand.Execute(null);
+        homeItem.OpenCommand.Execute(null);
         Assert.Single(history.GetRecent(60));
         Assert.Empty(preferences.GetPreferences(row.Context));
     }
@@ -302,8 +341,10 @@ public sealed class LauncherMemoryTests : IDisposable
         vm.Query = "";
         vm.Prime();
         Assert.Equal(0, vm.SelectedIndex);
-        Assert.Equal(AppSources.Pinned, vm.Results[0].Source);
-        vm.Results[0].TogglePinCommand.Execute(null);
+        var homePin = Assert.Single(vm.HomePins);
+        Assert.Equal(AppSources.Pinned, homePin.Source);
+        homePin.TogglePinCommand.Execute(null);
+        Assert.Empty(vm.HomePins);
         Assert.Empty(vm.Results);
         Assert.Equal(-1, vm.SelectedIndex);
     }

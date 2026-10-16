@@ -6,7 +6,7 @@
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <!--
-                    Theme-aware control chrome (tooltips, context menus, dropdown). The brush palette
+                    Theme-aware control chrome (tooltips, scrollbars and context menus). The brush palette
                     itself is applied in code by ThemeManager before the window is created, so its
                     DynamicResource references resolve as soon as the palette is installed.
                 -->

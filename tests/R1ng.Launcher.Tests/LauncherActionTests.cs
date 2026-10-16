@@ -36,7 +36,6 @@ public class LauncherActionTests
             Assert.Equal(other!.Title, viewModel.SelectedItem?.Title);
             Assert.True(viewModel.HasSelection);
             Assert.Equal(1, viewModel.HiddenCount);
-            Assert.Equal("已隐藏 (1)", viewModel.HiddenButtonText);
             Assert.Equal(Item(1).Target, Assert.Single(viewModel.HiddenItems).Target);
 
             // The immediate refresh ran, and its (hidden-unaware) provider rows are filtered again.
@@ -209,7 +208,6 @@ public class LauncherActionTests
 
             Assert.Equal(calls + 1, apps.Calls);
             Assert.Equal(1, viewModel.HiddenCount);
-            Assert.Equal("已隐藏 (1)", viewModel.HiddenButtonText);
             Assert.Equal(new[] { "report", "third" }, viewModel.Results.Select(row => row.Title).Order());
             Assert.Contains("已恢复", viewModel.ActionNotice);
             Assert.Equal(1, hidden.RestoreCalls);
@@ -286,7 +284,7 @@ public class LauncherActionTests
             context.ViewModel.ManageHiddenCommand.Execute(null);
 
             Assert.Equal(1, raised);
-            Assert.Equal("已隐藏 (0)", context.ViewModel.HiddenButtonText);
+            Assert.Equal(0, context.ViewModel.HiddenCount);
         });
     }
 
@@ -374,6 +372,60 @@ public class LauncherActionTests
             Assert.Empty(context.Preview.Requests);
             Assert.Contains("无法预览", viewModel.ActionNotice);
             Assert.False(viewModel.IsPreviewBusy);
+        });
+    }
+
+    [Fact]
+    public async Task Rapid_selection_switches_cancel_inflight_work_and_coalesce_to_the_latest_supported_row()
+    {
+        await RunAsync(context =>
+        {
+            context.Apps.Items = [Item(1, "one"), Item(2, "two"), Item(3, "three"), Item(4, "four")];
+            Search(context.ViewModel);
+            var pending = new TaskCompletionSource<QuickLookPreviewResult>();
+            context.Preview.SwitchPending = pending;
+
+            context.ViewModel.MoveSelection(1);
+            context.ViewModel.SwitchPreviewSelected();
+            var firstToken = context.Preview.LastSwitchToken;
+            context.ViewModel.MoveSelection(1);
+            context.ViewModel.SwitchPreviewSelected();
+            context.ViewModel.MoveSelection(1);
+            context.ViewModel.SwitchPreviewSelected();
+
+            Assert.Equal(new[] { Item(2, "two").Target }, context.Preview.SwitchRequests.Select(item => item.Target));
+            Assert.True(firstToken.IsCancellationRequested);
+
+            context.Preview.SwitchPending = null;
+            pending.SetResult(new QuickLookPreviewResult(true, "sent"));
+
+            Assert.Equal(new[] { Item(2, "two").Target, Item(4, "four").Target }, context.Preview.SwitchRequests.Select(item => item.Target));
+            Assert.Empty(context.Preview.Requests);
+        });
+    }
+
+    [Fact]
+    public async Task An_unsupported_navigation_row_cancels_pending_switches_without_sending_a_toggle()
+    {
+        await RunAsync(context =>
+        {
+            context.Apps.Items = [Item(1, "one"), Item(2, "two"), Item(3, "three")];
+            Search(context.ViewModel);
+            var pending = new TaskCompletionSource<QuickLookPreviewResult>();
+            context.Preview.SwitchPending = pending;
+
+            context.ViewModel.MoveSelection(1);
+            context.ViewModel.SwitchPreviewSelected();
+            var firstToken = context.Preview.LastSwitchToken;
+            context.Preview.CanPreviewResult = false;
+            context.ViewModel.MoveSelection(1);
+            context.ViewModel.SwitchPreviewSelected();
+
+            Assert.True(firstToken.IsCancellationRequested);
+            context.Preview.SwitchPending = null;
+            pending.SetResult(new QuickLookPreviewResult(true, "sent"));
+            Assert.Single(context.Preview.SwitchRequests);
+            Assert.Empty(context.Preview.Requests);
         });
     }
 
@@ -772,6 +824,8 @@ public class LauncherActionTests
     {
         public List<SearchResultItem> Requests { get; } = new();
 
+        public List<SearchResultItem> SwitchRequests { get; } = new();
+
         public bool CanPreviewResult { get; set; } = true;
 
         public QuickLookPreviewResult Result { get; set; } = new(true, "预览请求已发送");
@@ -783,11 +837,37 @@ public class LauncherActionTests
 
         public CancellationToken LastToken { get; private set; }
 
+        public TaskCompletionSource<QuickLookPreviewResult>? SwitchPending { get; set; }
+
+        public CancellationToken LastSwitchToken { get; private set; }
+
+        public int CloseCalls { get; private set; }
+        public TaskCompletionSource<QuickLookPreviewResult>? ClosePending { get; set; }
+        public CancellationToken LastCloseToken { get; private set; }
+        public List<string> Operations { get; } = new();
+
+        public Task<QuickLookPreviewResult> CloseAsync(CancellationToken cancellationToken = default)
+        {
+            CloseCalls++;
+            Operations.Add("Close");
+            LastCloseToken = cancellationToken;
+            return ClosePending?.Task ?? Task.FromResult(Result);
+        }
+
         public bool CanPreview(SearchResultItem item) => CanPreviewResult;
+
+        public Task<QuickLookPreviewResult> SwitchAsync(SearchResultItem item, CancellationToken cancellationToken = default)
+        {
+            SwitchRequests.Add(item);
+            Operations.Add("Switch:" + item.Target);
+            LastSwitchToken = cancellationToken;
+            return SwitchPending?.Task ?? Task.FromResult(Result);
+        }
 
         public Task<QuickLookPreviewResult> PreviewAsync(SearchResultItem item, CancellationToken cancellationToken = default)
         {
             Requests.Add(item);
+            Operations.Add("Toggle:" + item.Target);
             LastToken = cancellationToken;
             if (Throw is not null)
                 throw Throw;

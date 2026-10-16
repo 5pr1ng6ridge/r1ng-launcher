@@ -26,6 +26,7 @@ public class ThemePaletteTests
                      "CardBackgroundBrush",
                      "ChipBackgroundBrush",
                      "ToggleCheckedBackgroundBrush",
+                     "HoverBorderBrush",
                      "ResultSelectedBackgroundBrush",
                      "FooterButtonBackgroundBrush",
                      "DropdownBackgroundBrush",

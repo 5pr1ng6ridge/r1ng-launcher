@@ -69,11 +69,14 @@ public partial class HiddenItemsWindow : Window
         return restored;
     }
 
+    internal string? ErrorMessage { get; private set; }
+
     private void ShowError(string? message)
     {
-        var hasError = !string.IsNullOrWhiteSpace(message);
-        ErrorText.Text = hasError ? message : string.Empty;
-        ErrorBanner.Visibility = hasError ? Visibility.Visible : Visibility.Collapsed;
+        var normalized = string.IsNullOrWhiteSpace(message) ? null : message;
+        if (normalized is not null && !string.Equals(ErrorMessage, normalized, StringComparison.Ordinal))
+            _viewModel.SetActionNotice(normalized);
+        ErrorMessage = normalized;
     }
 
     private void OnRestoreClick(object sender, RoutedEventArgs e)

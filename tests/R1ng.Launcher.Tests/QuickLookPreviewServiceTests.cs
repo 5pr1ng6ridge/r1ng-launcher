@@ -154,12 +154,13 @@ public sealed class QuickLookPreviewServiceTests : IDisposable
     }
 
     [Fact]
-    public void Message_is_the_toggle_command_in_utf8_without_a_bom()
+    public void Toggle_and_switch_messages_use_the_verified_protocol_command_in_utf8_without_a_bom()
     {
-        var bytes = QuickLookPreviewService.BuildMessage(@"C:\a b\预览.txt");
+        var path = @"C:\a b\预览.txt";
 
-        Assert.Equal(Utf8NoBom.GetBytes("QuickLook.App.PipeMessages.Toggle|C:\\a b\\预览.txt|\n"), bytes);
-        Assert.NotEqual(0xEF, bytes[0]);
+        Assert.Equal(Utf8NoBom.GetBytes("QuickLook.App.PipeMessages.Toggle|C:\\a b\\预览.txt|\n"), QuickLookPreviewService.BuildMessage(path));
+        Assert.Equal(Utf8NoBom.GetBytes("QuickLook.App.PipeMessages.Switch|C:\\a b\\预览.txt|\n"), QuickLookPreviewService.BuildMessage(path, QuickLookPreviewService.SwitchCommand));
+        Assert.NotEqual(0xEF, QuickLookPreviewService.BuildMessage(path)[0]);
     }
 
     [Fact]
@@ -192,6 +193,54 @@ public sealed class QuickLookPreviewServiceTests : IDisposable
         Assert.Equal("预览请求已发送", result.Message);
         var received = await server.Received.WaitAsync(Wait);
         Assert.Equal(Utf8NoBom.GetBytes($"QuickLook.App.PipeMessages.Toggle|{file}|\n"), received);
+    }
+
+    [Fact]
+    public async Task Switching_sends_the_non_toggling_switch_command_for_an_existing_target()
+    {
+        var file = Path.Combine(_directory, "switch-target.txt");
+        File.WriteAllText(file, "hello");
+        using var server = new FakeQuickLook();
+
+        var result = await Service(server.Name).SwitchAsync(Item(file));
+
+        Assert.True(result.Success);
+        Assert.Equal(Utf8NoBom.GetBytes($"QuickLook.App.PipeMessages.Switch|{file}|\n"), await server.Received.WaitAsync(Wait));
+    }
+
+    [Fact]
+    public async Task Closing_sends_only_the_pathless_close_command_and_never_toggle_or_quit()
+    {
+        using var server = new FakeQuickLook();
+        var result = await Service(server.Name).CloseAsync();
+        Assert.True(result.Success);
+        Assert.Equal(Utf8NoBom.GetBytes("QuickLook.App.PipeMessages.Close||\n"), await server.Received.WaitAsync(Wait));
+    }
+
+    [Fact]
+    public async Task A_cancelled_close_sends_nothing_and_a_missing_pipe_fails_within_its_bound()
+    {
+        using var server = new FakeQuickLook();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var cancelled = await Service(server.Name).CloseAsync(cancellation.Token);
+        Assert.False(cancelled.Success);
+        Assert.False(server.Connected);
+        var unavailable = await Service(NewPipeName(), timeoutMilliseconds: 50).CloseAsync();
+        Assert.False(unavailable.Success);
+        Assert.Contains("超时", unavailable.Message);
+    }
+
+    [Fact]
+    public async Task An_unsupported_switch_target_sends_nothing()
+    {
+        using var server = new FakeQuickLook();
+
+        var result = await Service(server.Name).SwitchAsync(Item("https://example.com"));
+
+        Assert.False(result.Success);
+        await Task.Delay(100);
+        Assert.False(server.Connected);
     }
 
     [Fact]

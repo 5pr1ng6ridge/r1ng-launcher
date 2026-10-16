@@ -6,6 +6,3 @@ public enum AppTheme
     Dark = 0,
     Light = 1,
 }
-
-/// <summary>A selectable theme entry for the UI theme selector (ComboBox item).</summary>
-public sealed record ThemeOption(AppTheme Value, string DisplayName);

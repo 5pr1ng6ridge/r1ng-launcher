@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Windows.Automation;
 
 namespace R1ng.Launcher.Platform;
 
@@ -28,12 +29,19 @@ public interface IQueryEditor : IDisposable
     /// <summary>Raised (on a background thread, once per distinct problem) when the draft cannot be read back.</summary>
     event Action<QueryEditorError>? Failed;
 
+    /// <summary>Raised when this session's specific Notepad document tab closes, with its final saved file text.</summary>
+    event Action<QueryEditorClosed>? Closed;
+
     /// <summary>
     /// Opens the editor on <paramref name="text"/>. While a session is active this does not create or
     /// rewrite anything and returns the active session id; the caller decides what to tell the user.
     /// Concurrent calls are serialised. Failure and cancellation are returned, not thrown.
     /// </summary>
     Task<QueryEditorStartResult> StartAsync(string text, CancellationToken cancellationToken = default);
+
+    /// <summary>Starts with the launcher's desktop identity for safe close detection; never positions Notepad.</summary>
+    Task<QueryEditorStartResult> StartAsync(string text, QueryEditorLaunchContext? launchContext, CancellationToken cancellationToken = default) =>
+        StartAsync(text, cancellationToken);
 
     /// <summary>
     /// Re-reads the active session's draft right now (for example when the launcher is shown again),
@@ -53,6 +61,42 @@ public sealed record QueryEditorError(Guid SessionId, string Message);
 
 /// <summary><see cref="SessionId"/> is <see cref="Guid.Empty"/> when <see cref="Success"/> is false.</summary>
 public sealed record QueryEditorStartResult(bool Success, Guid SessionId, string? Error);
+
+/// <summary>The exact draft tab closed; <see cref="SavedText"/> is read from the stable draft file, never the unsaved editor buffer.</summary>
+public sealed record QueryEditorClosed(Guid SessionId, string SavedText);
+
+/// <summary>Launcher desktop identity captured before hiding, used only to rule out inconclusive tab absences.</summary>
+public sealed record QueryEditorLaunchContext(Guid? VirtualDesktopId);
+
+internal sealed record NotepadTabSnapshot(bool Reliable, IReadOnlyList<IntPtr> MatchingWindows);
+
+internal enum NotepadWindowLife
+{
+    Unknown,
+    Alive,
+    Destroyed,
+}
+
+internal enum NotepadWindowVisibility
+{
+    Unknown,
+    Visible,
+    Hidden,
+    Cloaked,
+}
+
+internal sealed record NotepadWindowState(
+    NotepadWindowLife Life,
+    bool IsMinimized,
+    NotepadWindowVisibility Visibility,
+    Guid? VirtualDesktopId);
+
+internal interface INotepadTabTracker
+{
+    NotepadTabSnapshot FindDraftTabs(string draftPath);
+
+    NotepadWindowState InspectWindow(IntPtr window);
+}
 
 /// <summary>
 /// <see cref="IQueryEditor"/> backed by the system Notepad. The session file is an independent
@@ -87,6 +131,7 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
     private readonly string _directory;
     private readonly Func<string, bool> _launchEditor;
+    private readonly INotepadTabTracker? _tabTracker;
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _settleDelay;
     private readonly TimeSpan _busyRetryDelay;
@@ -102,6 +147,15 @@ public sealed class NotepadQueryEditor : IQueryEditor
     /// test seams: a temp folder, an editor launcher (returns whether it started) and the poll period.
     /// </summary>
     public NotepadQueryEditor(string? temporaryDirectory = null, Func<string, bool>? launchEditor = null, TimeSpan? pollInterval = null)
+        : this(temporaryDirectory, launchEditor, pollInterval, tabTracker: null)
+    {
+    }
+
+    internal NotepadQueryEditor(
+        string? temporaryDirectory,
+        Func<string, bool>? launchEditor,
+        TimeSpan? pollInterval,
+        INotepadTabTracker? tabTracker)
     {
         var interval = pollInterval ?? DefaultPollInterval;
         if (interval <= TimeSpan.Zero || interval > TimeSpan.FromDays(1))
@@ -109,6 +163,7 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
         _directory = string.IsNullOrWhiteSpace(temporaryDirectory) ? DefaultDirectory : Path.GetFullPath(temporaryDirectory);
         _launchEditor = launchEditor ?? LaunchNotepad;
+        _tabTracker = tabTracker ?? (launchEditor is null ? new WindowsNotepadTabTracker() : null);
         _pollInterval = interval;
         // Two reads this far apart must agree before a save is believed (a writer may still be mid-write).
         _settleDelay = TimeSpan.FromMilliseconds(Math.Clamp(interval.TotalMilliseconds, 10, 100));
@@ -118,6 +173,8 @@ public sealed class NotepadQueryEditor : IQueryEditor
     public event Action<QueryEditorSaved>? Saved;
 
     public event Action<QueryEditorError>? Failed;
+
+    public event Action<QueryEditorClosed>? Closed;
 
     /// <summary>Launcher-owned folder under the user's temp path, not the launcher profile/data directory.</summary>
     internal static string DefaultDirectory => Path.Combine(Path.GetTempPath(), "r1ng-launcher", "query-editor");
@@ -143,7 +200,10 @@ public sealed class NotepadQueryEditor : IQueryEditor
         }
     }
 
-    public async Task<QueryEditorStartResult> StartAsync(string text, CancellationToken cancellationToken = default)
+    public Task<QueryEditorStartResult> StartAsync(string text, CancellationToken cancellationToken = default) =>
+        StartAsync(text, null, cancellationToken);
+
+    public async Task<QueryEditorStartResult> StartAsync(string text, QueryEditorLaunchContext? launchContext, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(text);
 
@@ -158,7 +218,7 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
         try
         {
-            return await StartCoreAsync(text, cancellationToken).ConfigureAwait(false);
+            return await StartCoreAsync(text, launchContext, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -176,8 +236,12 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
         try
         {
-            // Hop to the thread pool first so a UI-thread caller never does file IO inline.
-            await Task.Run(() => PollAsync(session, cancellationToken), CancellationToken.None).ConfigureAwait(false);
+            // Hop to the thread pool first so a UI-thread caller never does file IO or bounded UIA inline.
+            await Task.Run(async () =>
+            {
+                await PollAsync(session, cancellationToken).ConfigureAwait(false);
+                await ObserveTabAsync(session, cancellationToken).ConfigureAwait(false);
+            }, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -212,7 +276,7 @@ public sealed class NotepadQueryEditor : IQueryEditor
         Stop(session);
     }
 
-    private async Task<QueryEditorStartResult> StartCoreAsync(string text, CancellationToken cancellationToken)
+    private async Task<QueryEditorStartResult> StartCoreAsync(string text, QueryEditorLaunchContext? launchContext, CancellationToken cancellationToken)
     {
         lock (_gate)
         {
@@ -264,6 +328,20 @@ public sealed class NotepadQueryEditor : IQueryEditor
             return Failure(CancelledMessage);
         }
 
+        // Publish and monitor the session before dispatching the app. This closes the race where a
+        // fast user closes the newly-created tab before StartAsync returns. The file remains recoverable.
+        var session = new Session(id, path, text, payload, launchContext);
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                TryDelete(path);
+                return Failure(ClosedMessage);
+            }
+            _session = session;
+        }
+        _ = Task.Run(() => RunLoopAsync(session));
+
         // The initial file is the baseline: only a later, different save is reported. Once the editor
         // has been launched the call is not abandoned half-way, so cancellation is not observed again.
         bool launched;
@@ -278,20 +356,23 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
         if (!launched)
         {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_session, session))
+                    _session = null;
+            }
+            Stop(session);
             // Never handed to an editor, so the file is ours to remove.
             TryDelete(path);
             return Failure("无法启动记事本");
         }
 
-        var session = new Session(id, path, text, payload);
         lock (_gate)
         {
-            if (_disposed)
+            if (_disposed || !ReferenceEquals(_session, session))
                 return Failure(ClosedMessage); // Already handed to the editor: the file is kept, never deleted.
-            _session = session;
         }
 
-        _ = Task.Run(() => RunLoopAsync(session));
         return new QueryEditorStartResult(true, id, null);
     }
 
@@ -300,9 +381,12 @@ public sealed class NotepadQueryEditor : IQueryEditor
         var token = session.Cts.Token;
         try
         {
-            using var timer = new PeriodicTimer(_pollInterval);
-            while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+            while (!token.IsCancellationRequested)
+            {
                 await PollAsync(session, token).ConfigureAwait(false);
+                await ObserveTabAsync(session, token).ConfigureAwait(false);
+                await Task.Delay(_pollInterval, token).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -341,6 +425,177 @@ public sealed class NotepadQueryEditor : IQueryEditor
         {
             session.PollGate.Release();
         }
+    }
+
+    private const int TabTrackingGraceObservations = 20;
+
+    private async Task ObserveTabAsync(Session session, CancellationToken cancellationToken)
+    {
+        if (_tabTracker is null)
+            return;
+
+        await session.PollGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (session.Ended || session.ClosedRaised)
+                return;
+
+            NotepadTabSnapshot snapshot;
+            try
+            {
+                snapshot = _tabTracker.FindDraftTabs(session.FilePath);
+            }
+            catch (Exception)
+            {
+                snapshot = new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+            }
+
+            session.TrackingObservations++;
+            var matchingWindows = snapshot.MatchingWindows
+                .Where(handle => handle != IntPtr.Zero)
+                .Distinct()
+                .Where(handle => InspectWindow(handle).Life != NotepadWindowLife.Destroyed)
+                .ToArray();
+            if (matchingWindows.Length > 0)
+            {
+                session.HasObservedTab = true;
+                session.MissingTabObservations = 0;
+                foreach (var window in matchingWindows)
+                {
+                    session.ObservedWindows.Add(window);
+                    var state = InspectWindow(window);
+                    if (state.VirtualDesktopId is { } desktopId)
+                        session.ObservedDesktopIds[window] = desktopId;
+
+                }
+
+                return;
+            }
+
+            if (!snapshot.Reliable)
+            {
+                // An incomplete tree cannot rule out a replacement matching tab. Keep the debounce
+                // consecutive across reliable scans only, even if every previously seen HWND died.
+                session.MissingTabObservations = 0;
+                WarnIfTrackingGraceElapsed(session);
+                return;
+            }
+
+            var states = session.ObservedWindows.ToDictionary(window => window, InspectWindow);
+
+            if (!session.HasObservedTab)
+            {
+                WarnIfTrackingGraceElapsed(session);
+                return;
+            }
+
+            // Reliable UIA absence may mean the document tab closed, but not if its known host is
+            // minimized, hidden/cloaked, or has moved away from its observed desktop.
+            foreach (var (window, state) in states)
+            {
+                if (state.Life == NotepadWindowLife.Unknown
+                    || state.IsMinimized
+                    || state.Life == NotepadWindowLife.Alive && state.Visibility != NotepadWindowVisibility.Visible)
+                {
+                    session.MissingTabObservations = 0;
+                    WarnIfTrackingGraceElapsed(session);
+                    return;
+                }
+
+                if (state.Life == NotepadWindowLife.Alive)
+                {
+                    var expectedDesktop = session.LaunchContext?.VirtualDesktopId;
+                    if (expectedDesktop is null && session.ObservedDesktopIds.TryGetValue(window, out var observedDesktop))
+                        expectedDesktop = observedDesktop;
+                    if (expectedDesktop is null || state.VirtualDesktopId != expectedDesktop)
+                    {
+                        session.MissingTabObservations = 0;
+                        WarnIfTrackingGraceElapsed(session);
+                        return;
+                    }
+                }
+            }
+
+            if (++session.MissingTabObservations < 2)
+                return;
+
+            await RaiseClosedFromStableDraftAsync(session, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            session.PollGate.Release();
+        }
+    }
+
+    private NotepadWindowState InspectWindow(IntPtr window)
+    {
+        try
+        {
+            return _tabTracker!.InspectWindow(window);
+        }
+        catch (Exception)
+        {
+            return new NotepadWindowState(NotepadWindowLife.Unknown, false, NotepadWindowVisibility.Unknown, null);
+        }
+    }
+
+    private void WarnIfTrackingGraceElapsed(Session session)
+    {
+        if (session.TrackingObservations >= TabTrackingGraceObservations)
+            WarnOnce(session, "无法可靠跟踪此记事本标签的自动关闭；草稿仍在监控并保留，可用启动器热键返回或手动结束编辑");
+    }
+
+    private void WarnOnce(Session session, string message)
+    {
+        if (session.Ended || !session.WarningMessages.Add(message))
+            return;
+        RaiseSafely(Failed, new QueryEditorError(session.Id, message));
+    }
+
+    private async Task RaiseClosedFromStableDraftAsync(Session session, CancellationToken cancellationToken)
+    {
+        var first = await ReadBoundedAsync(session.FilePath, cancellationToken).ConfigureAwait(false);
+        if (first.Kind != ReadKind.Ok)
+        {
+            ApplyReadFailure(session, first.Kind);
+            return;
+        }
+
+        await Task.Delay(_settleDelay, cancellationToken).ConfigureAwait(false);
+        var second = await ReadBoundedAsync(session.FilePath, cancellationToken).ConfigureAwait(false);
+        if (second.Kind != ReadKind.Ok)
+        {
+            ApplyReadFailure(session, second.Kind);
+            return;
+        }
+
+        if (!first.Bytes!.AsSpan().SequenceEqual(second.Bytes!))
+        {
+            Transient(session, BusyMessage);
+            return;
+        }
+
+        if (!TryDecode(second.Bytes!, out var text))
+        {
+            Permanent(session, second.Bytes, BadEncodingMessage);
+            return;
+        }
+
+        // The stable draft file is the source of truth. Unsaved Notepad UI text is never read.
+        session.ProcessedBytes = second.Bytes;
+        session.TransientCount = 0;
+        session.ErrorKey = null;
+        if (!string.Equals(text, session.LastText, StringComparison.Ordinal))
+        {
+            session.LastText = text;
+            RaiseSafely(Saved, new QueryEditorSaved(session.Id, ++session.Sequence, text));
+        }
+
+        if (session.Ended)
+            return;
+
+        session.ClosedRaised = true;
+        RaiseSafely(Closed, new QueryEditorClosed(session.Id, text));
     }
 
     private async Task PollCoreAsync(Session session, CancellationToken cancellationToken)
@@ -616,17 +871,25 @@ public sealed class NotepadQueryEditor : IQueryEditor
 
     private sealed class Session
     {
-        public Session(Guid id, string filePath, string initialText, byte[] initialBytes)
+        public Session(
+            Guid id,
+            string filePath,
+            string initialText,
+            byte[] initialBytes,
+            QueryEditorLaunchContext? launchContext)
         {
             Id = id;
             FilePath = filePath;
             LastText = initialText;
             ProcessedBytes = initialBytes;
+            LaunchContext = launchContext;
         }
 
         public Guid Id { get; }
 
         public string FilePath { get; }
+
+        public QueryEditorLaunchContext? LaunchContext { get; }
 
         public CancellationTokenSource Cts { get; } = new();
 
@@ -642,5 +905,154 @@ public sealed class NotepadQueryEditor : IQueryEditor
         public string? ErrorKey;
         public bool ErrorIsTransient;
         public int TransientCount;
+        public bool HasObservedTab;
+        public int MissingTabObservations;
+        public int TrackingObservations;
+        public bool ClosedRaised;
+        public HashSet<IntPtr> ObservedWindows { get; } = new();
+        public Dictionary<IntPtr, Guid> ObservedDesktopIds { get; } = new();
+        public HashSet<string> WarningMessages { get; } = new(StringComparer.Ordinal);
+    }
+}
+
+/// <summary>
+/// Best-effort Windows 11 tab ownership by the launcher's unpredictable draft filename. UI Automation
+/// is queried on a bounded STA worker; an incomplete tree is never treated as evidence of closure.
+/// </summary>
+internal sealed class WindowsNotepadTabTracker : INotepadTabTracker
+{
+    private static readonly TimeSpan UiAutomationTimeout = TimeSpan.FromMilliseconds(700);
+    private int _scanActive;
+
+    public NotepadTabSnapshot FindDraftTabs(string draftPath)
+    {
+        if (Interlocked.CompareExchange(ref _scanActive, 1, 0) != 0)
+            return new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+
+        var outcome = BoundedStaCall.Run(
+            () => ScanDraftTabs(Path.GetFileName(draftPath)),
+            UiAutomationTimeout,
+            "R1ng Notepad tab UIA");
+        if (outcome.Completed)
+            Interlocked.Exchange(ref _scanActive, 0);
+        else
+            _ = outcome.Completion.ContinueWith(
+                _ => Interlocked.Exchange(ref _scanActive, 0),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
+        return outcome.Completed && outcome.Value is { } snapshot
+            ? snapshot
+            : new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+    }
+
+    public NotepadWindowState InspectWindow(IntPtr window)
+    {
+        if (window == IntPtr.Zero)
+            return new NotepadWindowState(NotepadWindowLife.Unknown, false, NotepadWindowVisibility.Unknown, null);
+        if (!NativeMethods.IsWindow(window))
+            return new NotepadWindowState(NotepadWindowLife.Destroyed, false, NotepadWindowVisibility.Unknown, null);
+
+        var visibility = !NativeMethods.IsWindowVisible(window)
+            ? NotepadWindowVisibility.Hidden
+            : NativeMethods.TryGetWindowCloaked(window, out var cloaked)
+                ? cloaked ? NotepadWindowVisibility.Cloaked : NotepadWindowVisibility.Visible
+                : NotepadWindowVisibility.Unknown;
+        return new NotepadWindowState(
+            NotepadWindowLife.Alive,
+            NativeMethods.IsIconic(window),
+            visibility,
+            ScreenPlacement.TryGetWindowDesktopId(window));
+    }
+
+    private static NotepadTabSnapshot ScanDraftTabs(string draftFileName)
+    {
+        var matches = new HashSet<IntPtr>();
+        try
+        {
+            var root = AutomationElement.RootElement;
+            var windows = root.FindAll(TreeScope.Children, Condition.TrueCondition);
+            foreach (AutomationElement window in windows)
+            {
+                int processId;
+                int nativeHandle;
+                string windowName;
+                try
+                {
+                    processId = window.Current.ProcessId;
+                    nativeHandle = window.Current.NativeWindowHandle;
+                    windowName = window.Current.Name;
+                }
+                catch (ElementNotAvailableException)
+                {
+                    return new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+                }
+
+                if (!IsNotepadProcess(processId))
+                    continue;
+
+                var hwnd = new IntPtr(nativeHandle);
+                if (MatchesDraftName(windowName, draftFileName) && hwnd != IntPtr.Zero)
+                    matches.Add(hwnd);
+
+                AutomationElementCollection descendants;
+                try
+                {
+                    descendants = window.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                }
+                catch (Exception)
+                {
+                    return new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+                }
+
+                foreach (AutomationElement element in descendants)
+                {
+                    try
+                    {
+                        var current = element.Current;
+                        if (current.ControlType == ControlType.TabItem
+                            && MatchesDraftName(current.Name, draftFileName)
+                            && hwnd != IntPtr.Zero)
+                        {
+                            matches.Add(hwnd);
+                        }
+                    }
+                    catch (ElementNotAvailableException)
+                    {
+                        return new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+                    }
+                }
+            }
+
+            return new NotepadTabSnapshot(true, matches.ToArray());
+        }
+        catch (Exception)
+        {
+            return new NotepadTabSnapshot(false, Array.Empty<IntPtr>());
+        }
+    }
+
+    private static bool IsNotepadProcess(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return string.Equals(process.ProcessName, "Notepad", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool MatchesDraftName(string? automationName, string draftFileName)
+    {
+        if (string.IsNullOrWhiteSpace(automationName))
+            return false;
+
+        var stem = Path.GetFileNameWithoutExtension(draftFileName);
+        return automationName.Contains(draftFileName, StringComparison.OrdinalIgnoreCase)
+            || automationName.Contains(stem, StringComparison.OrdinalIgnoreCase);
     }
 }

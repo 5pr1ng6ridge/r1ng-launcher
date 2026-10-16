@@ -24,6 +24,14 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
     private readonly IQuickLookPreviewService _previewService;
     private CancellationTokenSource? _iconCancellation;
     private CancellationTokenSource? _previewCancellation;
+    private CancellationTokenSource? _switchCancellation;
+    private CancellationTokenSource? _closePreviewCancellation;
+    private readonly SemaphoreSlim _previewRequestGate = new(1, 1);
+    private SearchResultItem? _queuedSwitch;
+    private long _switchGeneration;
+    private long _quickLookPlacementGeneration;
+    private long _queuedSwitchPlacementGeneration;
+    private bool _switchDrainRunning;
     private bool _isPreviewBusy;
     private string? _actionNotice;
     private bool _disposed;
@@ -102,6 +110,12 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         };
 
         SetScopeCommand = new RelayCommand<SearchScope>(SetScope);
+        ToggleThemeCommand = new RelayCommand(ToggleTheme);
+        HomePins.CollectionChanged += (_, _) =>
+        {
+            OnPropertyChanged(nameof(HasHomePins));
+            OnPropertyChanged(nameof(ShowHomeTiles));
+        };
         RefreshFileBackendCommand = new RelayCommand(RefreshFileBackend);
         OpenCommand = new RelayCommand(() => OpenSelected(), () => HasSelection);
         OpenContainingFolderCommand = new RelayCommand(() => OpenContainingFolderSelected(), () => HasSelection);
@@ -112,7 +126,19 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     public ObservableCollection<ResultItemViewModel> Results { get; } = new();
 
+    /// <summary>Pinned applications on home, displayed as the single horizontal tile row; pinned files stay in Results.</summary>
+    public ObservableCollection<ResultItemViewModel> HomePins { get; } = new();
+
+    public bool HasHomePins => HomePins.Count > 0;
+
+    public bool ShowHomeTiles => IsHomeQuery && HasHomePins;
+
+    /// <summary>True for the default blank/whitespace-query home view.</summary>
+    public bool IsHomeQuery => string.IsNullOrWhiteSpace(_query);
+
     public ICommand SetScopeCommand { get; }
+
+    public ICommand ToggleThemeCommand { get; }
 
     public ICommand RefreshFileBackendCommand { get; }
 
@@ -122,10 +148,10 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     public ICommand CopyPathCommand { get; }
 
-    /// <summary>Explicitly quits the resident launcher (footer “退出” button).</summary>
+    /// <summary>Explicitly quits the resident launcher (wired to the tray menu).</summary>
     public ICommand QuitCommand { get; }
 
-    /// <summary>Opens the hidden-items manager (footer “已隐藏”); the view reacts to <see cref="RequestManageHidden"/>.</summary>
+    /// <summary>Opens the hidden-items manager (wired to the tray menu).</summary>
     public ICommand ManageHiddenCommand { get; }
 
     /// <summary>Raised when the user asks to review or restore hidden items.</summary>
@@ -139,13 +165,6 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     public bool ShowPlaceholder => string.IsNullOrEmpty(_query);
 
-    /// <summary>The selectable palettes for the discoverable theme selector.</summary>
-    public IReadOnlyList<ThemeOption> ThemeOptions { get; } =
-    [
-        new ThemeOption(AppTheme.Dark, "深色"),
-        new ThemeOption(AppTheme.Light, "浅色"),
-    ];
-
     /// <summary>Active palette. Setting it applies and persists the theme through the injected seam.</summary>
     public AppTheme Theme
     {
@@ -155,12 +174,18 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             if (!SetProperty(ref _theme, value))
                 return;
 
-            OnPropertyChanged(nameof(ThemeLabel));
+            OnPropertyChanged(nameof(ThemeToggleGlyph));
+            OnPropertyChanged(nameof(ThemeToggleAutomationName));
             _applyTheme?.Invoke(value);
         }
     }
 
-    public string ThemeLabel => _theme == AppTheme.Light ? "浅色" : "深色";
+    /// <summary>The icon advertises the palette that the button will switch to.</summary>
+    public string ThemeToggleGlyph => Theme == AppTheme.Dark ? "\uE706" : "\uE708";
+
+    public string ThemeToggleAutomationName => Theme == AppTheme.Dark ? "切换到浅色主题" : "切换到深色主题";
+
+    public void ToggleTheme() => Theme = Theme == AppTheme.Dark ? AppTheme.Light : AppTheme.Dark;
 
     /// <summary>
     /// The user's keywords with any leading folder prefix removed. The prefix is only a constraint;
@@ -180,16 +205,17 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             if (!SetProperty(ref _selectedIndex, value))
                 return;
 
-            // -1 means "nothing selected" (e.g. the list was just emptied).
+            // Home navigation covers the tile row followed by the recent-history list.
             if (value >= 0)
-                _selection.Reset(Results.Count, value);
+                _selection.Reset(SelectionCount, value);
 
+            UpdateSelectionFlags();
             OnPropertyChanged(nameof(HasSelection));
             RaiseCommandStates();
         }
     }
 
-    public bool HasSelection => _selection.HasSelection && Results.Count > 0;
+    public bool HasSelection => SelectedItem is not null;
 
     public bool IsSearching
     {
@@ -203,7 +229,10 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         private set
         {
             if (SetProperty(ref _statusText, value))
+            {
                 OnPropertyChanged(nameof(ShowStateMessage));
+                OnPropertyChanged(nameof(EmptyResultsMessage));
+            }
         }
     }
 
@@ -219,8 +248,11 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     public bool ShowFileNotice => !string.IsNullOrEmpty(_fileNotice);
 
+    /// <summary>Only neutral empty-state guidance belongs in the card; diagnostics use floating notices.</summary>
+    public string EmptyResultsMessage => BuildEmptyMessage(_snapshot);
+
     /// <summary>
-    /// Hotkey warning shown in the launcher (for example when the preferred combination fell back or
+    /// Hotkey warning presented in a transient floating notice (for example when the combination fell back or
     /// when no combination could be registered at all). Null when the preferred hotkey is active.
     /// </summary>
     public string? HotKeyNotice
@@ -242,11 +274,11 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref _isHotKeyFailure, value);
     }
 
-    /// <summary>Records the hotkey registration outcome for the banner (called once at startup).</summary>
+    /// <summary>Records the hotkey registration outcome for a floating notice (called once at startup).</summary>
     public void SetHotKeyStatus(string? notice, bool isFailure)
     {
-        HotKeyNotice = notice;
         IsHotKeyFailure = isFailure;
+        HotKeyNotice = notice;
     }
 
     public string FooterHint
@@ -260,8 +292,8 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Result of the last user action (hide, restore, preview, notepad editing) that has to stay
-    /// visible. It is independent of <see cref="FooterHint"/> and <see cref="StatusText"/>, so a
+    /// Result of the last user action (hide, restore, preview, notepad editing), retained as state
+    /// while its independent UI notice expires. It is independent of <see cref="FooterHint"/> and <see cref="StatusText"/>, so a
     /// following asynchronous search cannot erase it; only typing a different query or the next
     /// action replaces it.
     /// </summary>
@@ -289,7 +321,11 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (_disposed)
             return;
 
-        ActionNotice = string.IsNullOrWhiteSpace(notice) ? null : notice;
+        var normalized = string.IsNullOrWhiteSpace(notice) ? null : notice;
+        if (normalized is not null && string.Equals(ActionNotice, normalized, StringComparison.Ordinal))
+            OnPropertyChanged(nameof(ActionNotice)); // A repeated action renews the transient notice.
+        else
+            ActionNotice = normalized;
     }
 
     /// <summary>The hidden items of the current profile, for the manager window (never null).</summary>
@@ -300,9 +336,6 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     /// <summary>Latest hidden-list read/save problem, shown in the manager window; null when healthy.</summary>
     public string? HiddenError => _hiddenResults?.Error;
-
-    /// <summary>Footer button caption, always reachable even when the result list is empty.</summary>
-    public string HiddenButtonText => $"已隐藏 ({HiddenCount})";
 
     /// <summary>True while a QuickLook request is in flight; a second request is not queued.</summary>
     public bool IsPreviewBusy
@@ -387,10 +420,32 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>Application scope icon: selected for application-only or all-results mode.</summary>
+    public bool IsApplicationsIncluded
+    {
+        get => _scope != SearchScope.Files;
+        set
+        {
+            if (value != IsApplicationsIncluded)
+                SetScope(value ? SearchScope.All : SearchScope.Files);
+        }
+    }
+
+    /// <summary>File scope icon: selected for file-only or all-results mode; the last deselection switches modes.</summary>
+    public bool IsFilesIncluded
+    {
+        get => _scope != SearchScope.Applications;
+        set
+        {
+            if (value != IsFilesIncluded)
+                SetScope(value ? SearchScope.All : SearchScope.Applications);
+        }
+    }
+
     /// <summary>Kicks off the initial (empty query) load, e.g. when the window first opens.</summary>
     public void Prime() => ScheduleSearch(immediate: true);
 
-    /// <summary>Raised when the user asks the launcher to exit from the UI (the footer “退出” button).</summary>
+    /// <summary>Raised when the tray menu asks the launcher to exit.</summary>
     public event Action? RequestQuit;
 
     public void SetScope(SearchScope scope)
@@ -402,6 +457,8 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(IsScopeAll));
         OnPropertyChanged(nameof(IsScopeApplications));
         OnPropertyChanged(nameof(IsScopeFiles));
+        OnPropertyChanged(nameof(IsApplicationsIncluded));
+        OnPropertyChanged(nameof(IsFilesIncluded));
 
         // Application matching must never search app names using the folder text: drop the automatic
         // folder constraint while preserving the user's keywords.
@@ -451,6 +508,8 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(IsScopeAll));
             OnPropertyChanged(nameof(IsScopeApplications));
             OnPropertyChanged(nameof(IsScopeFiles));
+            OnPropertyChanged(nameof(IsApplicationsIncluded));
+            OnPropertyChanged(nameof(IsFilesIncluded));
         }
 
         // Immediate (not debounced) so the folder constraint is applied at once and a quick repeated
@@ -461,10 +520,25 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     private void SetQuery(string value, bool immediate)
     {
+        var wasHome = IsHomeQuery;
         var changed = SetProperty(ref _query, value, nameof(Query));
         if (changed)
         {
             OnPropertyChanged(nameof(ShowPlaceholder));
+            var isHome = IsHomeQuery;
+            if (wasHome != isHome)
+            {
+                OnPropertyChanged(nameof(IsHomeQuery));
+                OnPropertyChanged(nameof(ShowHomeTiles));
+                // The home selection spans pins then history. Once typing hides the pin strip, map a
+                // selected history row back to its position in the visible search-result list.
+                var preferred = wasHome ? Math.Max(0, _selectedIndex - HomePins.Count) : _selectedIndex;
+                _selection.Reset(SelectionCount, preferred);
+                _selectedIndex = _selection.Index;
+                OnPropertyChanged(nameof(SelectedIndex));
+                OnPropertyChanged(nameof(HasSelection));
+                UpdateSelectionFlags();
+            }
 
             // A different query makes the previous action's notice obsolete.
             ActionNotice = null;
@@ -476,9 +550,9 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     public bool MoveSelection(int delta)
     {
-        if (!_selection.HasSelection && Results.Count > 0)
+        if (!_selection.HasSelection && SelectionCount > 0)
         {
-            _selection.Reset(Results.Count);
+            _selection.Reset(SelectionCount);
             SelectedIndex = _selection.Index;
             return true;
         }
@@ -521,8 +595,29 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             CopyPath(item);
     }
 
-    public ResultItemViewModel? SelectedItem =>
-        SelectedIndex >= 0 && SelectedIndex < Results.Count ? Results[SelectedIndex] : null;
+    public ResultItemViewModel? SelectedItem
+    {
+        get
+        {
+            if (SelectedIndex < 0)
+                return null;
+            if (IsHomeQuery)
+                return SelectedIndex < HomePins.Count
+                    ? HomePins[SelectedIndex]
+                    : Results.ElementAtOrDefault(SelectedIndex - HomePins.Count);
+            return Results.ElementAtOrDefault(SelectedIndex);
+        }
+    }
+
+    private int SelectionCount => IsHomeQuery ? HomePins.Count + Results.Count : Results.Count;
+
+    private void UpdateSelectionFlags()
+    {
+        for (var index = 0; index < HomePins.Count; index++)
+            HomePins[index].IsSelected = IsHomeQuery && index == _selectedIndex;
+        for (var index = 0; index < Results.Count; index++)
+            Results[index].IsSelected = index + (IsHomeQuery ? HomePins.Count : 0) == _selectedIndex;
+    }
 
     public bool IsPinned(SearchResultItem item) => _history.IsPinned(item);
 
@@ -544,9 +639,9 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         FooterHint = BuildFooterHint(_snapshot);
         SetActionNotice(null);
         item.IsPinned = pinned;
-        foreach (var row in Results)
+        foreach (var row in Results.Concat(HomePins))
             row.IsPinned = _history.IsPinned(row.Model);
-        if (Query.Trim().Length == 0)
+        if (IsHomeQuery)
             ScheduleSearch(immediate: true);
     }
 
@@ -557,6 +652,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (!_openTarget(item.Model))
         {
             StatusText = $"无法打开：{item.Title}";
+            SetActionNotice(StatusText);
             return;
         }
         _history.Record(item.Model);
@@ -569,7 +665,10 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (_disposed || item is null)
             return;
         if (!_openContainingTarget(item.Model))
+        {
             StatusText = $"无法定位：{item.Title}";
+            SetActionNotice(StatusText);
+        }
         else
             RequestHide?.Invoke();
     }
@@ -579,6 +678,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (_disposed || item is null)
             return;
         StatusText = _copyTarget(item.Model) ? $"已复制路径：{item.Model.CopyText}" : "复制失败：剪贴板被占用";
+        SetActionNotice(StatusText);
     }
 
     /// <summary>
@@ -604,7 +704,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
         NotifyHiddenChanged();
         RemoveHiddenRows();
-        SetActionNotice($"已隐藏：{item.Title}（可在底部“已隐藏”中恢复）");
+        SetActionNotice($"已隐藏：{item.Title}（可从系统托盘“已隐藏”中恢复）");
 
         // Immediate, so any generation that may still carry the item is invalidated and cancelled.
         ScheduleSearch(immediate: true);
@@ -670,7 +770,6 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HiddenError));
         OnPropertyChanged(nameof(HiddenItems));
         OnPropertyChanged(nameof(HiddenCount));
-        OnPropertyChanged(nameof(HiddenButtonText));
     }
 
     private bool IsHiddenNow(SearchResultItem item) => _hiddenResults?.IsHidden(item) ?? false;
@@ -679,17 +778,22 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
     private void RemoveHiddenRows()
     {
         var keep = Results.Where(row => !IsHiddenNow(row.Model)).ToList();
-        if (keep.Count == Results.Count)
+        var keepPins = HomePins.Where(row => !IsHiddenNow(row.Model)).ToList();
+        if (keep.Count == Results.Count && keepPins.Count == HomePins.Count)
             return;
 
         var preferredIndex = Math.Max(0, _selectedIndex);
+        HomePins.Clear();
+        foreach (var row in keepPins)
+            HomePins.Add(row);
         Results.Clear();
         foreach (var row in keep)
             Results.Add(row);
 
-        _selection.Reset(Results.Count, preferredIndex);
+        _selection.Reset(SelectionCount, preferredIndex);
         _selectedIndex = _selection.Index;
         OnPropertyChanged(nameof(SelectedIndex));
+        UpdateSelectionFlags();
         OnPropertyChanged(nameof(HasSelection));
         OnPropertyChanged(nameof(ShowStateMessage));
         RaiseCommandStates();
@@ -709,6 +813,85 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
 
     /// <summary>Fire-and-forget QuickLook preview of one row; completion is reported through the notice.</summary>
     public void Preview(ResultItemViewModel item) => _ = PreviewAsync(item);
+
+    /// <summary>
+    /// Switches an already-open QuickLook preview after keyboard or mouse selection changes;
+    /// the protocol's Switch command is a no-op when QuickLook is closed.
+    /// </summary>
+    public void SwitchPreviewSelected()
+    {
+        if (_disposed)
+            return;
+
+        var item = SelectedItem?.Model;
+        if (item is not null)
+        {
+            try
+            {
+                if (!_previewService.CanPreview(item))
+                    item = null;
+            }
+            catch (Exception)
+            {
+                item = null;
+            }
+        }
+
+        _switchGeneration++;
+        _queuedSwitchPlacementGeneration = BeginQuickLookPlacementRequest();
+        _queuedSwitch = item;
+        try
+        {
+            _switchCancellation?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The previous switch finished between reading the source and cancelling it.
+        }
+
+        if (_queuedSwitch is not null && !_switchDrainRunning)
+            _ = DrainSwitchRequestsAsync();
+    }
+
+    /// <summary>Invalidates old work and orders Close after it, ahead of requests from a later show.</summary>
+    public async Task ClosePreviewAsync()
+    {
+        if (_disposed) return;
+        _switchGeneration++;
+        _quickLookPlacementGeneration++;
+        _queuedSwitch = null;
+        CancelPreviewRequest(_previewCancellation);
+        CancelPreviewRequest(_switchCancellation);
+        CancelPreviewRequest(_closePreviewCancellation);
+        _previewCancellation = null;
+        IsPreviewBusy = false;
+        var cancellation = new CancellationTokenSource();
+        _closePreviewCancellation = cancellation;
+        var entered = false;
+        try
+        {
+            await _previewRequestGate.WaitAsync(cancellation.Token).ConfigureAwait(true);
+            entered = true;
+            if (!_disposed && !cancellation.IsCancellationRequested)
+                await _previewService.CloseAsync(cancellation.Token).ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            // Best effort: a missing/stopped QuickLook must not block hiding or create a new warning.
+        }
+        finally
+        {
+            if (entered) _previewRequestGate.Release();
+            if (ReferenceEquals(_closePreviewCancellation, cancellation)) _closePreviewCancellation = null;
+            cancellation.Dispose();
+        }
+    }
+
+    private static void CancelPreviewRequest(CancellationTokenSource? cancellation)
+    {
+        try { cancellation?.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
 
     /// <summary>
     /// Asks QuickLook to preview the item. This is a view-only action: it never goes through
@@ -731,11 +914,15 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var placementGeneration = BeginQuickLookPlacementRequest();
         var cancellation = new CancellationTokenSource();
         _previewCancellation = cancellation;
         IsPreviewBusy = true;
+        var requestGateEntered = false;
         try
         {
+            await _previewRequestGate.WaitAsync(cancellation.Token).ConfigureAwait(true);
+            requestGateEntered = true;
             var result = await _previewService.PreviewAsync(item.Model, cancellation.Token).ConfigureAwait(true);
             if (_disposed || cancellation.IsCancellationRequested)
                 return;
@@ -747,6 +934,9 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
                         ? $"QuickLook 预览失败：{item.Title}"
                         : result.Message
             );
+
+            if (result.Success && placementGeneration == _quickLookPlacementGeneration)
+                QuickLookPlacementRequestCompleted?.Invoke(placementGeneration);
         }
         catch (OperationCanceledException)
         {
@@ -754,19 +944,89 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         }
         catch (Exception exception)
         {
-            if (!_disposed)
+            if (!_disposed && !cancellation.IsCancellationRequested)
                 SetActionNotice($"QuickLook 预览失败：{exception.Message}");
         }
         finally
         {
+            if (requestGateEntered)
+                _previewRequestGate.Release();
             if (ReferenceEquals(_previewCancellation, cancellation))
+            {
                 _previewCancellation = null;
-
+                if (!_disposed) IsPreviewBusy = false;
+            }
             cancellation.Dispose();
-            if (!_disposed)
-                IsPreviewBusy = false;
         }
     }
+
+    private async Task DrainSwitchRequestsAsync()
+    {
+        _switchDrainRunning = true;
+        try
+        {
+            while (!_disposed && _queuedSwitch is { } item)
+            {
+                var generation = _switchGeneration;
+                var placementGeneration = _queuedSwitchPlacementGeneration;
+                _queuedSwitch = null;
+                var cancellation = new CancellationTokenSource();
+                _switchCancellation = cancellation;
+                var requestGateEntered = false;
+                try
+                {
+                    await _previewRequestGate.WaitAsync(cancellation.Token).ConfigureAwait(true);
+                    requestGateEntered = true;
+                    if (generation == _switchGeneration && !cancellation.IsCancellationRequested)
+                    {
+                        var result = await _previewService.SwitchAsync(item, cancellation.Token).ConfigureAwait(true);
+                        if (result.Success
+                            && !_disposed
+                            && !cancellation.IsCancellationRequested
+                            && placementGeneration == _quickLookPlacementGeneration)
+                        {
+                            QuickLookPlacementRequestCompleted?.Invoke(placementGeneration);
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Navigation superseded the request, or the view model was disposed.
+                }
+                catch (Exception)
+                {
+                    // Switching is opportunistic navigation; it must not interrupt typing or selection.
+                }
+                finally
+                {
+                    if (requestGateEntered)
+                        _previewRequestGate.Release();
+                    if (ReferenceEquals(_switchCancellation, cancellation))
+                        _switchCancellation = null;
+                    cancellation.Dispose();
+                }
+            }
+        }
+        finally
+        {
+            _switchDrainRunning = false;
+            if (!_disposed && _queuedSwitch is not null)
+                _ = DrainSwitchRequestsAsync();
+        }
+    }
+
+    private long BeginQuickLookPlacementRequest()
+    {
+        var generation = ++_quickLookPlacementGeneration;
+        QuickLookPlacementRequestStarted?.Invoke(generation);
+        return generation;
+    }
+
+    /// <summary>Raised synchronously before sending Toggle/Switch so the view can capture its current HWND.</summary>
+    public event Action<long>? QuickLookPlacementRequestStarted;
+
+    /// <summary>Raised after a successful one-way request has been sent; the window can begin bounded late discovery.</summary>
+    public event Action<long>? QuickLookPlacementRequestCompleted;
 
     /// <summary>Raised when a launch succeeded and the window should hide.</summary>
     public event Action? RequestHide;
@@ -782,6 +1042,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (_disposed)
             return;
         _disposed = true;
+        _quickLookPlacementGeneration++;
         _debounce.Stop();
         CancelInFlightSearch();
         _iconCancellation?.Cancel();
@@ -792,11 +1053,15 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         try
         {
             _previewCancellation?.Cancel();
+            _switchCancellation?.Cancel();
+            _closePreviewCancellation?.Cancel();
         }
         catch (ObjectDisposedException)
         {
             // Already finished and disposed.
         }
+
+        _queuedSwitch = null;
     }
 
     private void ScheduleSearch(bool immediate = false)
@@ -883,6 +1148,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             if (_controller.IsCurrent(generation))
             {
                 StatusText = $"搜索失败：{exception.Message}";
+                SetActionNotice(StatusText);
                 IsSearching = false;
             }
         }
@@ -905,22 +1171,32 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (_disposed)
             return;
         Results.Clear();
+        HomePins.Clear();
 
         // Re-check the latest hidden state: a snapshot that was ranked before the item was hidden
-        // must not bring it back.
+        // must not bring it back. On the blank-query home, only pinned applications occupy the
+        // separate tile row. Pinned files/folders retain their order at the top of the ordinary list.
         foreach (var item in snapshot.Items)
         {
-            if (!IsHiddenNow(item))
-                Results.Add(new ResultItemViewModel(item, this, snapshot.Context));
+            if (IsHiddenNow(item))
+                continue;
+            var row = new ResultItemViewModel(item, this, snapshot.Context);
+            if (IsHomeQuery && row.IsPinned && row.Model.Kind == ResultKind.Application)
+                HomePins.Add(row);
+            else
+                Results.Add(row);
         }
 
-        _selection.Reset(Results.Count);
+        _selection.Reset(SelectionCount);
         _selectedIndex = _selection.Index;
         OnPropertyChanged(nameof(SelectedIndex));
+        UpdateSelectionFlags();
         OnPropertyChanged(nameof(HasSelection));
 
-        StatusText = snapshot.StatusText ?? (Results.Count == 0 ? BuildEmptyMessage(snapshot) : null);
+        StatusText = snapshot.StatusText ?? (SelectionCount == 0 ? BuildEmptyMessage(snapshot) : null);
         FileNotice = snapshot.FileNotice;
+        if (!string.IsNullOrWhiteSpace(snapshot.StatusText)) SetActionNotice(snapshot.StatusText);
+        OnPropertyChanged(nameof(EmptyResultsMessage));
         FooterHint = BuildFooterHint(snapshot);
         OnPropertyChanged(nameof(ShowStateMessage));
         RaiseCommandStates();
@@ -940,9 +1216,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
             };
         }
 
-        return snapshot.FilesUnavailable
-            ? $"文件搜索不可用：{snapshot.FileNotice}\n应用中没有匹配项"
-            : "没有匹配的结果";
+        return "没有匹配的结果";
     }
 
     private string BuildFooterHint(SearchSnapshot snapshot)
@@ -951,7 +1225,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         if (snapshot.Query.Trim().Length > 0)
             parts.Add($"{Results.Count} 个结果");
         else
-            parts.Add("最近使用");
+            parts.Add($"置顶 {HomePins.Count + Results.Count(row => row.IsPinned)} · 最近使用 {Results.Count(row => !row.IsPinned)}");
 
         if (snapshot.FilesUnavailable && _scope != SearchScope.Applications)
             parts.Add("文件：不可用");
@@ -965,7 +1239,7 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
         _iconCancellation?.Dispose();
         _iconCancellation = new CancellationTokenSource();
         var token = _iconCancellation.Token;
-        foreach (var row in Results)
+        foreach (var row in Results.Concat(HomePins))
             _ = LoadIconAsync(row, token);
     }
 
@@ -978,7 +1252,8 @@ public sealed class LauncherViewModel : ObservableObject, IDisposable
                 return;
             await _dispatcher.InvokeAsync(() =>
             {
-                if (!_disposed && !cancellationToken.IsCancellationRequested && Results.Contains(row))
+                if (!_disposed && !cancellationToken.IsCancellationRequested
+                    && (Results.Contains(row) || HomePins.Contains(row)))
                     row.Icon = icon;
             }, DispatcherPriority.Background, cancellationToken).Task.ConfigureAwait(false);
         }

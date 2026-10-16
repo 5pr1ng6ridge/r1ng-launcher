@@ -44,8 +44,7 @@ public class ContextMenuRenderTests
             // The production template, not WPF's default one (which has the icon gutter).
             var chrome = Assert.IsType<Border>(menu.Template.FindName("MenuChrome", menu));
             AssertBrush(palette, "DropdownBackgroundBrush", chrome.Background);
-            AssertBrush(palette, "DropdownBorderBrush", chrome.BorderBrush);
-            Assert.Equal(new Thickness(1), chrome.BorderThickness);
+            Assert.Equal(new Thickness(0), chrome.BorderThickness);
             Assert.True(chrome.CornerRadius.TopLeft > 0, "the menu border must be rounded");
             Assert.Same(chrome, VisualTreeHelper.GetChild(menu, 0));
 
@@ -61,6 +60,8 @@ public class ContextMenuRenderTests
                     case Border border:
                         AssertThemed(border.Background, allowed, "Border.Background");
                         AssertThemed(border.BorderBrush, allowed, "Border.BorderBrush");
+                        Assert.True(border.BorderThickness == new Thickness(0) || border.BorderBrush is null
+                            || Assert.IsType<SolidColorBrush>(border.BorderBrush).Color.A == 0);
                         break;
                     case Panel panel:
                         AssertThemed(panel.Background, allowed, "Panel.Background");
@@ -79,6 +80,7 @@ public class ContextMenuRenderTests
             var hairline = Over(BrushColor(palette, "DropdownBorderBrush"), surface);
 
             Assert.Equal(0, pixels.At(0, 0).A);
+            AssertPixel(surface, pixels.At(0, (int)Math.Floor(menu.ActualHeight / 2)), "borderless left edge");
 
             foreach (var item in fixture.Items)
             {
@@ -144,12 +146,13 @@ public class ContextMenuRenderTests
 
             var light = ThemePalette.Create(AppTheme.Light);
             AssertBrush(light, "DropdownBackgroundBrush", chrome.Background);
-            AssertBrush(light, "DropdownBorderBrush", chrome.BorderBrush);
+            Assert.Equal(new Thickness(0), chrome.BorderThickness);
             AssertBrush(light, "DropdownBorderBrush", separatorLine.Background);
             AssertBrush(light, "TextPrimaryBrush", fixture.Items[0].Foreground);
 
             SetHighlighted(fixture.Items[0], true);
-            AssertBrush(light, "DropdownHoverBackgroundBrush", menuBorder.Background);
+            Assert.Equal(Colors.Transparent, Assert.IsType<SolidColorBrush>(menuBorder.Background).Color);
+            AssertBrush(light, "HoverBorderBrush", Assert.IsType<Border>(fixture.Items[0].Template.FindName("MenuOutline", fixture.Items[0])).BorderBrush);
 
             // And it has pixels of the light surface, not stale dark ones.
             var pixels = Pixels.Render(menu);
@@ -208,23 +211,28 @@ public class ContextMenuRenderTests
 
             // Highlight: the themed hover brush on that item only, in the rendered pixels as well.
             var surface = BrushColor(palette, "DropdownBackgroundBrush");
-            var hover = Over(BrushColor(palette, "DropdownHoverBackgroundBrush"), surface);
-            Assert.True(Distance(surface, hover) > 4, "the highlight must be visible against the surface");
+            var hover = Over(BrushColor(palette, "HoverBorderBrush"), surface);
+            Assert.True(Distance(surface, hover) > 4, "the highlight outline must be visible against the surface");
 
             Assert.Equal(Colors.Transparent, Assert.IsAssignableFrom<SolidColorBrush>(ItemBorder(items[1]).Background).Color);
             SetHighlighted(items[1], true);
-            AssertBrush(palette, "DropdownHoverBackgroundBrush", ItemBorder(items[1]).Background);
+            Assert.Equal(Colors.Transparent, Assert.IsType<SolidColorBrush>(ItemBorder(items[1]).Background).Color);
+            var outline = Assert.IsType<Border>(items[1].Template.FindName("MenuOutline", items[1]));
+            AssertBrush(palette, "HoverBorderBrush", outline.BorderBrush);
+            Assert.False(outline.IsHitTestVisible);
             Assert.Equal(Colors.Transparent, Assert.IsAssignableFrom<SolidColorBrush>(ItemBorder(items[0]).Background).Color);
 
             var pixels = Pixels.Render(fixture.Menu);
             var bounds = BoundsIn(fixture.Menu, items[1]);
             var x = (int)Math.Ceiling(bounds.Left) + 3;
-            AssertPixel(hover, pixels.At(x, (int)Math.Round(bounds.Top + bounds.Height / 2)), "highlighted item");
+            AssertPixel(surface, pixels.At(x, (int)Math.Round(bounds.Top + bounds.Height / 2)), "unfilled highlighted item");
+            AssertPixel(hover, pixels.At((int)Math.Floor(bounds.Left), (int)Math.Round(bounds.Top + bounds.Height / 2)), "highlighted item outline");
             var other = BoundsIn(fixture.Menu, items[0]);
             AssertPixel(surface, pixels.At(x, (int)Math.Round(other.Top + other.Height / 2)), "neighbour of the highlighted item");
 
             SetHighlighted(items[1], false);
             Assert.Equal(Colors.Transparent, Assert.IsAssignableFrom<SolidColorBrush>(ItemBorder(items[1]).Background).Color);
+            Assert.Equal(0, Assert.IsType<SolidColorBrush>(outline.BorderBrush).Color.A);
 
             // Disabled: dimmed, and a command that cannot execute disables the item and follows
             // CanExecuteChanged. The command here is a stand-in, never a production one.
@@ -283,7 +291,7 @@ public class ContextMenuRenderTests
             Assert.Equal(Visibility.Visible, bar.Visibility);
             Assert.True(bar.ActualWidth > 0);
             var thumb = Descendants(bar).OfType<Thumb>().Single();
-            var thumbFace = Assert.IsType<Border>(VisualTreeHelper.GetChild(thumb, 0));
+            var thumbFace = Assert.IsType<Border>(thumb.Template.FindName("ThumbBorder", thumb));
             AssertBrush(palette, "TextMutedBrush", thumbFace.Background);
             Assert.DoesNotContain(Descendants(scroll), visual => visual is Shape);
 
@@ -348,6 +356,38 @@ public class ContextMenuRenderTests
         });
     }
 
+    [Fact]
+    public async Task Pinned_tiles_use_the_same_clicked_row_bound_menu_commands()
+    {
+        await RunAsync(AppTheme.Light, fixture =>
+        {
+            fixture.Item.IsPinned = true;
+            var template = Assert.IsType<DataTemplate>(fixture.Window.Resources["PinnedTileTemplate"]);
+            var tile = Assert.IsType<Button>(template.LoadContent());
+            tile.DataContext = fixture.Item;
+            var menu = Assert.IsType<ContextMenu>(tile.ContextMenu);
+            menu.Resources = fixture.Window.Resources;
+            menu.DataContext = fixture.Item;
+            menu.PlacementTarget = tile;
+            foreach (var item in menu.Items.OfType<MenuItem>())
+            {
+                item.GetBindingExpression(MenuItem.CommandProperty)?.UpdateTarget();
+                item.GetBindingExpression(MenuItem.HeaderProperty)?.UpdateTarget();
+            }
+            LayoutMenu(menu);
+
+            var items = menu.Items.OfType<MenuItem>().ToArray();
+            Assert.Equal(new[] { "打开", "打开所在位置", "QuickLook 预览", "复制路径", "取消置顶", "隐藏此项" },
+                items.Select(item => item.Header));
+            Assert.Same(fixture.Item.OpenCommand, items[0].Command);
+            Assert.Same(fixture.Item.OpenContainingFolderCommand, items[1].Command);
+            Assert.Same(fixture.Item.PreviewCommand, items[2].Command);
+            Assert.Same(fixture.Item.CopyPathCommand, items[3].Command);
+            Assert.Same(fixture.Item.TogglePinCommand, items[4].Command);
+            Assert.Same(fixture.Item.HideCommand, items[5].Command);
+        });
+    }
+
     // ----- harness -----------------------------------------------------------------------------
 
     private sealed class Fixture
@@ -379,7 +419,8 @@ public class ContextMenuRenderTests
                 using var viewModel = new LauncherViewModel(
                     new SearchController(new EmptyAppProvider(), new EmptyFileProvider()),
                     new EmptyHistoryProvider(),
-                    dispatcher
+                    dispatcher,
+                    previewService: new LauncherActionTests.FakePreviewService()
                 );
 
                 window = new MainWindow(viewModel);

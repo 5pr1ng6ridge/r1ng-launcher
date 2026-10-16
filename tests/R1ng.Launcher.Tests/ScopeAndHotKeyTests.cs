@@ -62,6 +62,67 @@ public class ScopeAndHotKeyTests
         Assert.True(fixture.ViewModel.IsScopeApplications);
     }
 
+    [Theory]
+    [InlineData(SearchScope.All, true, true)]
+    [InlineData(SearchScope.Applications, true, false)]
+    [InlineData(SearchScope.Files, false, true)]
+    public void Scope_icon_states_are_only_a_projection_of_the_existing_three_modes(SearchScope scope, bool applications, bool files)
+    {
+        using var fixture = new Fixture();
+        fixture.ViewModel.SetScope(scope);
+        Assert.Equal(applications, fixture.ViewModel.IsApplicationsIncluded);
+        Assert.Equal(files, fixture.ViewModel.IsFilesIncluded);
+    }
+
+    [Theory]
+    [InlineData(SearchScope.All, true, SearchScope.Files)]
+    [InlineData(SearchScope.All, false, SearchScope.Applications)]
+    [InlineData(SearchScope.Applications, true, SearchScope.Files)]
+    [InlineData(SearchScope.Applications, false, SearchScope.All)]
+    [InlineData(SearchScope.Files, true, SearchScope.All)]
+    [InlineData(SearchScope.Files, false, SearchScope.Applications)]
+    public void Scope_icon_clicks_use_single_or_double_selection_and_last_deselection_switches_modes(
+        SearchScope initial, bool clickApplications, SearchScope expected)
+    {
+        using var fixture = new Fixture();
+        var vm = fixture.ViewModel;
+        vm.SetScope(initial);
+        vm.Query = "report";
+        if (clickApplications)
+            vm.IsApplicationsIncluded = !vm.IsApplicationsIncluded;
+        else
+            vm.IsFilesIncluded = !vm.IsFilesIncluded;
+
+        Assert.Equal(expected == SearchScope.All, vm.IsScopeAll);
+        Assert.Equal(expected == SearchScope.Applications, vm.IsScopeApplications);
+        Assert.Equal(expected == SearchScope.Files, vm.IsScopeFiles);
+        Assert.True(vm.IsApplicationsIncluded || vm.IsFilesIncluded);
+        Assert.Equal("report", vm.Query);
+    }
+
+    [Fact]
+    public void Scope_icons_keep_folder_prefix_rules_and_follow_file_hotkey_notifications()
+    {
+        using var fixture = new Fixture();
+        var vm = fixture.ViewModel;
+        vm.Query = "\"C:\\folder\" report";
+        vm.IsFilesIncluded = false;
+        Assert.True(vm.IsScopeApplications);
+        Assert.Equal("report", vm.Query);
+
+        var changed = new List<string?>();
+        vm.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        vm.ApplyFileScope(@"D:\other");
+        Assert.False(vm.IsApplicationsIncluded);
+        Assert.True(vm.IsFilesIncluded);
+        Assert.Contains(nameof(LauncherViewModel.IsApplicationsIncluded), changed);
+        Assert.Contains(nameof(LauncherViewModel.IsFilesIncluded), changed);
+        Assert.Equal("\"D:\\other\" report", vm.Query);
+        vm.IsApplicationsIncluded = true;
+        Assert.True(vm.IsScopeAll);
+        Assert.Equal("\"D:\\other\" report", vm.Query);
+    }
+
     [Fact]
     public void The_file_hotkey_replaces_the_prefix_instead_of_stacking_it()
     {
@@ -127,7 +188,7 @@ public class ScopeAndHotKeyTests
     }
 
     [Fact]
-    public void Theme_selection_invokes_the_apply_seam_and_exposes_both_palettes()
+    public void Theme_toggle_invokes_the_apply_seam_and_updates_its_accessible_action_icon()
     {
         AppTheme? applied = null;
         using var viewModel = new LauncherViewModel(
@@ -138,13 +199,16 @@ public class ScopeAndHotKeyTests
         );
 
         Assert.Equal(AppTheme.Dark, viewModel.Theme);
-        Assert.Equal(2, viewModel.ThemeOptions.Count);
-        Assert.Equal("深色", viewModel.ThemeLabel);
+        Assert.Equal("\uE706", viewModel.ThemeToggleGlyph);
+        Assert.Equal("切换到浅色主题", viewModel.ThemeToggleAutomationName);
 
-        viewModel.Theme = AppTheme.Light;
+        viewModel.ToggleThemeCommand.Execute(null);
 
         Assert.Equal(AppTheme.Light, applied);
-        Assert.Equal("浅色", viewModel.ThemeLabel);
+        Assert.Equal("\uE708", viewModel.ThemeToggleGlyph);
+        Assert.Equal("切换到深色主题", viewModel.ThemeToggleAutomationName);
+        viewModel.ToggleThemeCommand.Execute(null);
+        Assert.Equal(AppTheme.Dark, applied);
     }
 
     private sealed class Fixture : IDisposable

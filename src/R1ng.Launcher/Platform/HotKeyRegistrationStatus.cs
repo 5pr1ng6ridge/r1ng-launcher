@@ -7,8 +7,8 @@ namespace R1ng.Launcher.Platform;
 /// </summary>
 public readonly record struct HotKeyRegistrationStatus(string Summary, string? Notice, bool IsFailure)
 {
-    /// <summary>Points at the always-available UI quit route when the hotkey never came up.</summary>
-    public const string UnavailableNotice = "快捷键不可用，点击界面右下角“退出”可关闭本程序";
+    /// <summary>Points at the always-available tray route when the launcher hotkey never came up.</summary>
+    public const string UnavailableNotice = "快捷键不可用，可通过系统托盘图标打开或退出";
 
     /// <summary>
     /// Builds the presentation from the registration result. A successful fallback is informational,

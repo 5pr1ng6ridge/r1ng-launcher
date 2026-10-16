@@ -92,7 +92,7 @@ public class LauncherViewModelTests
         Assert.True(viewModel.ShowHotKeyNotice);
         Assert.False(viewModel.IsHotKeyFailure);
 
-        viewModel.SetHotKeyStatus("均注册失败；点击界面右下角“退出”可关闭本程序", isFailure: true);
+        viewModel.SetHotKeyStatus("均注册失败；可通过系统托盘图标打开或退出", isFailure: true);
 
         Assert.True(viewModel.ShowHotKeyNotice);
         Assert.True(viewModel.IsHotKeyFailure);

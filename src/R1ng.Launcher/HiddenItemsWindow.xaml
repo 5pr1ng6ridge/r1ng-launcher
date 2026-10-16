@@ -22,6 +22,7 @@
         <!-- Colours come from the same swappable palette as the launcher (DynamicResource). -->
 
         <Style x:Key="ActionButtonStyle" TargetType="Button">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
             <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
             <Setter Property="FontSize" Value="11.5" />
             <Setter Property="Padding" Value="12,4" />
@@ -29,16 +30,18 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="ButtonBorder"
-                                CornerRadius="6"
-                                Background="{DynamicResource FooterButtonBackgroundBrush}"
-                                BorderBrush="{DynamicResource FooterButtonBorderBrush}"
-                                BorderThickness="1"
-                                Padding="{TemplateBinding Padding}">
-                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
-                        </Border>
+                        <Grid>
+                            <Border x:Name="ButtonBorder" CornerRadius="6" Background="{DynamicResource FooterButtonBackgroundBrush}"
+                                    BorderThickness="0" Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Border>
+                            <Border x:Name="ButtonOutline" CornerRadius="6" Style="{DynamicResource HoverOutlineStyle}" />
+                        </Grid>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
                                 <Setter TargetName="ButtonBorder" Property="Background" Value="{DynamicResource ChipHoverBackgroundBrush}" />
                                 <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
                             </Trigger>
@@ -58,14 +61,12 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ListBoxItem">
-                        <Border x:Name="RowBackground" CornerRadius="8" Background="Transparent" Padding="10,7">
-                            <ContentPresenter />
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource ResultHoverBackgroundBrush}" />
-                            </Trigger>
-                        </ControlTemplate.Triggers>
+                        <Grid>
+                            <Border x:Name="RowBackground" CornerRadius="8" Background="Transparent" Padding="10,7">
+                                <ContentPresenter />
+                            </Border>
+                            <Border x:Name="RowOutline" CornerRadius="8" Style="{DynamicResource HoverOutlineStyle}" />
+                        </Grid>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
@@ -112,15 +113,13 @@
     <Grid Margin="14">
         <Border CornerRadius="14"
                 Background="{DynamicResource CardBackgroundBrush}"
-                BorderBrush="{DynamicResource CardBorderBrush}"
-                BorderThickness="1">
+                BorderThickness="0">
             <Border.Effect>
                 <DropShadowEffect BlurRadius="22" ShadowDepth="4" Opacity="0.5" Color="#000000" />
             </Border.Effect>
 
             <Grid>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
@@ -142,23 +141,9 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Store problem or failed restore -->
-                <Border x:Name="ErrorBanner"
-                        Grid.Row="1"
-                        Margin="16,6,16,0"
-                        Padding="10,7"
-                        CornerRadius="8"
-                        Background="{DynamicResource FailureBackgroundBrush}"
-                        Visibility="Collapsed">
-                    <TextBlock x:Name="ErrorText"
-                               FontSize="11.5"
-                               TextWrapping="Wrap"
-                               Foreground="{DynamicResource FailureTextBrush}"
-                               AutomationProperties.Name="已隐藏项目错误" />
-                </Border>
-
+                <!-- Store/restore diagnostics use the launcher's independent transient notice. -->
                 <!-- List and empty state -->
-                <Grid Grid.Row="2" Margin="8,8,8,0">
+                <Grid Grid.Row="1" Margin="8,8,8,0">
                     <ListBox x:Name="RowsList"
                              ItemTemplate="{StaticResource HiddenRowTemplate}"
                              ItemContainerStyle="{StaticResource HiddenRowStyle}"
@@ -179,7 +164,7 @@
                 </Grid>
 
                 <!-- Footer -->
-                <StackPanel Grid.Row="3"
+                <StackPanel Grid.Row="2"
                             Orientation="Horizontal"
                             HorizontalAlignment="Right"
                             Margin="16,10,16,14">

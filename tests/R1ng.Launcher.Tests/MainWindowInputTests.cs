@@ -201,7 +201,8 @@ public class MainWindowInputTests
                 using var viewModel = new LauncherViewModel(
                     new SearchController(new EmptyAppProvider(), new EmptyFileProvider()),
                     new EmptyHistoryProvider(),
-                    dispatcher
+                    dispatcher,
+                    previewService: new LauncherActionTests.FakePreviewService()
                 );
 
                 window = new MainWindow(viewModel, explorerFolderResolver: explorerFolderResolver);

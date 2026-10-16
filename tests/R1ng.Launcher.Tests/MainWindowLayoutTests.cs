@@ -13,7 +13,7 @@ namespace R1ng.Launcher.Tests;
 
 /// <summary>
 /// Real-window layout, placement and scrolling behavior on an STA thread: the window grows with a few
-/// results and stops at its cap with the footer still visible, the bounded virtualized list keeps the
+/// results and stops at its cap with the header still visible, the bounded virtualized list keeps the
 /// keyboard selection in view, a refresh that keeps the first row scrolls back to the top, and the
 /// native window is placed in device pixels inside a work area sampled once per show. The production
 /// control styles and palette are merged into the window's own scope (no Application exists in a test);
@@ -24,7 +24,7 @@ public class MainWindowLayoutTests
     private const double Tolerance = 1.5;
 
     [Fact]
-    public async Task The_window_grows_with_a_few_results_and_stops_at_its_cap_with_the_footer_visible()
+    public async Task The_window_grows_with_a_few_results_and_stops_at_its_cap_without_a_footer()
     {
         await RunAsync(harness =>
         {
@@ -38,7 +38,7 @@ public class MainWindowLayoutTests
             harness.SetResults(3);
             var threeRows = window.ActualHeight;
             Assert.True(threeRows > oneRow + 10, $"3 rows ({threeRows}) must be taller than 1 row ({oneRow})");
-            AssertFooterVisible(window);
+            AssertHeaderVisible(window);
             Assert.Equal(Visibility.Collapsed, ScrollViewerOf(window).ComputedVerticalScrollBarVisibility);
 
             harness.SetResults(40);
@@ -50,9 +50,10 @@ public class MainWindowLayoutTests
             );
             Assert.True(window.MaxHeight <= MainWindow.MaxDesignHeight);
 
-            // Footer, theme selector and quit button are still inside the capped window; the list is
-            // the part that scrolls, and it stays virtualized instead of realizing every row.
-            AssertFooterVisible(window);
+            // The header stays outside scrolling; results fill the card down to its bottom margin
+            // and stay virtualized instead of realizing every row.
+            AssertHeaderVisible(window);
+            AssertResultsFillCard(window);
             var viewer = ScrollViewerOf(window);
             Assert.Equal(Visibility.Visible, viewer.ComputedVerticalScrollBarVisibility);
             Assert.True(viewer.ViewportHeight > 0 && viewer.ViewportHeight < viewer.ExtentHeight);
@@ -63,7 +64,8 @@ public class MainWindowLayoutTests
 
             harness.SetResults(2);
             Assert.True(window.ActualHeight < capped - 10, "the window must shrink again for a short list");
-            AssertFooterVisible(window);
+            AssertHeaderVisible(window);
+            AssertResultsFillCard(window);
             Assert.Equal(top, harness.WindowTopPixels());
         });
     }
@@ -203,12 +205,13 @@ public class MainWindowLayoutTests
             Assert.False(string.IsNullOrEmpty(message!.Text));
 
             var messageBounds = BoundsIn(window, message);
-            var selectorBounds = BoundsIn(window, window.ThemeSelector);
+            var themeBounds = BoundsIn(window, window.ThemeToggleButton);
             Assert.True(messageBounds.Height > 0);
-            Assert.True(messageBounds.Bottom <= selectorBounds.Top + Tolerance, "the message must sit above the footer");
+            Assert.True(messageBounds.Top >= themeBounds.Bottom - Tolerance, "the message must sit below the header");
             Assert.True(window.ActualHeight < full - 50, "an empty list must not keep the full-height window");
-            Assert.True(window.ActualHeight >= selectorBounds.Bottom, "the footer must stay inside the window");
-            AssertFooterVisible(window);
+            Assert.True(window.ActualHeight >= messageBounds.Bottom, "the message must stay inside the window");
+            AssertHeaderVisible(window);
+            AssertResultsFillCard(window);
         });
     }
 
@@ -253,7 +256,7 @@ public class MainWindowLayoutTests
     }
 
     [Fact]
-    public async Task A_short_narrow_work_area_limits_the_window_and_keeps_banners_and_footer_visible()
+    public async Task A_short_narrow_work_area_keeps_header_visible_without_inline_warning_banners()
     {
         await RunAsync(harness =>
         {
@@ -261,7 +264,7 @@ public class MainWindowLayoutTests
             var scale = harness.WindowScale();
 
             // 420 x 330 DIPs worth of real pixels, offset from the monitor origin: far below the
-            // 760 x 520 design size, with a long two-line hotkey failure banner on top.
+            // 760 x 520 design size, even with a long two-line transient hotkey warning.
             var real = ScreenPlacement.SampleCursorMonitor().WorkArea;
             var narrow = new ScreenPlacement.PixelsRect(
                 real.Left + 30,
@@ -273,7 +276,7 @@ public class MainWindowLayoutTests
             harness.Pinned = new ScreenPlacement.MonitorSample(narrow, scale);
 
             harness.ViewModel.SetHotKeyStatus(
-                "Alt + Space 与 Ctrl + Shift + Space 均已被其他程序占用，请关闭占用方后重启；也可点击右下角“退出”关闭本程序。",
+                "Alt + Space 与 Ctrl + Shift + Space 均已被其他程序占用；可通过系统托盘图标打开或退出。",
                 isFailure: true
             );
             harness.SetResults(40);
@@ -285,11 +288,11 @@ public class MainWindowLayoutTests
             Assert.True(window.MaxHeight <= (narrow.Height / scale) + Tolerance);
             Assert.True(window.Width < MainWindow.DesignWidth);
 
-            // The scrolling list gives way: banner and footer are laid out inside the window.
-            var banner = FindDescendants<TextBlock>(window).First(block => block.Text.StartsWith("Alt + Space"));
-            Assert.True(banner.IsVisible);
-            Assert.True(BoundsIn(window, banner).Bottom <= window.ActualHeight + Tolerance);
-            AssertFooterVisible(window);
+            // Diagnostics never consume card height or duplicate their text in the results.
+            Assert.Null(window.FindName("HotKeyNoticeBanner"));
+            Assert.DoesNotContain(FindDescendants<TextBlock>(window), block => block.Text.StartsWith("Alt + Space"));
+            AssertHeaderVisible(window);
+            AssertResultsFillCard(window);
 
             harness.Press(Key.End);
             AssertRowInViewport(window, 39);
@@ -297,47 +300,51 @@ public class MainWindowLayoutTests
     }
 
     [Fact]
-    public async Task Arrow_keys_are_left_alone_while_the_theme_dropdown_is_open()
+    public async Task Theme_button_has_no_tooltip_owns_its_focus_and_returns_focus_to_query_after_toggle()
     {
         await RunAsync(harness =>
         {
             harness.SetResults(10);
             harness.Show();
+            var button = harness.Window.ThemeToggleButton;
+            var initialTheme = harness.ViewModel.Theme;
 
-            // An open dropdown needs Up/Down/Home/End for its own items.
-            harness.Window.ThemeSelector.IsDropDownOpen = true;
-            Assert.False(harness.Press(Key.Down), "the dropdown needs the arrow keys");
-            Assert.False(harness.Press(Key.End));
-            Assert.Equal(0, harness.ViewModel.SelectedIndex);
+            Assert.Null(button.ToolTip);
+            Assert.Null(System.Windows.Controls.ToolTipService.GetToolTip(button));
+            Assert.Empty(FindDescendants<ComboBox>(harness.Window));
+            Keyboard.Focus(button);
+            Assert.True(button.IsKeyboardFocusWithin);
+            Assert.True(harness.Press(Key.Down), "keyboard arrows still navigate results while a header control has focus");
+            Assert.Equal(1, harness.ViewModel.SelectedIndex);
+            Assert.True(harness.Press(Key.End));
+            Assert.Equal(9, harness.ViewModel.SelectedIndex);
 
-            // Closing the dropdown restores the query focus, so arrows navigate results again
-            // instead of accidentally changing and persisting another theme.
-            var dropdownClosed = false;
-            harness.Window.ThemeSelector.DropDownClosed += (_, _) => dropdownClosed = true;
-            harness.Window.ThemeSelector.IsDropDownOpen = false;
-            harness.PumpUntil(() => dropdownClosed, "the dropdown's closing animation must finish");
+            button.Command.Execute(null);
+            button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent, button));
+            harness.Pump();
+            Assert.NotEqual(initialTheme, harness.ViewModel.Theme);
             Assert.True(harness.Window.SearchBox.IsKeyboardFocusWithin);
             Assert.True(harness.Press(Key.Down));
-            Assert.Equal(1, harness.ViewModel.SelectedIndex);
+            Assert.Equal(0, harness.ViewModel.SelectedIndex);
         });
     }
 
-    [Theory]
-    [InlineData(Key.Enter)]
-    [InlineData(Key.Escape)]
-    public async Task Enter_and_escape_are_left_to_the_open_theme_dropdown(Key key)
+    [Fact]
+    public async Task Enter_and_space_are_not_hijacked_for_theme_button_activation_but_escape_still_hides()
     {
         await RunAsync(harness =>
         {
             harness.SetResults(10);
             harness.Show();
-            harness.Window.ThemeSelector.IsDropDownOpen = true;
+            Keyboard.Focus(harness.Window.ThemeToggleButton);
 
-            Assert.False(harness.Press(key), "the open dropdown owns commit/cancel keys");
-            Assert.True(harness.Window.IsVisible, "Escape must not hide the launcher while a dropdown is open");
+            Assert.False(harness.Press(Key.Enter), "Enter belongs to the focused button");
+            Assert.False(harness.Press(Key.Space), "Space belongs to the focused button");
+            Assert.True(harness.Window.IsVisible);
             Assert.Equal(0, harness.ViewModel.SelectedIndex);
             Assert.Null(harness.ViewModel.StatusText);
-            harness.Window.ThemeSelector.IsDropDownOpen = false;
+            Assert.True(harness.Press(Key.Escape));
+            Assert.False(harness.Window.IsVisible);
         });
     }
 
@@ -367,19 +374,24 @@ public class MainWindowLayoutTests
         });
     }
 
-    private static void AssertFooterVisible(MainWindow window)
+    private static void AssertResultsFillCard(MainWindow window)
     {
-        var selector = BoundsIn(window, window.ThemeSelector);
-        Assert.True(selector.Height > 0);
-        Assert.True(selector.Top >= 0);
-        Assert.True(
-            selector.Bottom <= window.ActualHeight + Tolerance,
-            $"footer bottom {selector.Bottom} is outside the window height {window.ActualHeight}"
-        );
+        var card = BoundsIn(window, window.CardBorder);
+        var results = BoundsIn(window, window.ResultsViewport);
+        Assert.InRange(card.Bottom - results.Bottom, 8 - Tolerance, 10 + Tolerance);
+        Assert.True(results.Top >= BoundsIn(window, window.SearchHeader).Bottom);
+        Assert.Null(window.FindName("FooterHintText"));
+    }
 
-        var quit = FindDescendants<Button>(window).First(button => button.Content as string == "退出");
-        var quitBounds = BoundsIn(window, quit);
-        Assert.True(quitBounds.Bottom <= window.ActualHeight + Tolerance);
+    private static void AssertHeaderVisible(MainWindow window)
+    {
+        var theme = BoundsIn(window, window.ThemeToggleButton);
+        Assert.True(theme.Height > 0);
+        Assert.True(theme.Top >= 0);
+        Assert.True(
+            theme.Bottom <= window.ActualHeight + Tolerance,
+            $"header bottom {theme.Bottom} is outside the window height {window.ActualHeight}"
+        );
     }
 
     private static void AssertRowInViewport(MainWindow window, int index)
@@ -485,7 +497,8 @@ public class MainWindowLayoutTests
             ViewModel = new LauncherViewModel(
                 new SearchController(_apps, new EmptyFileProvider()),
                 new EmptyHistoryProvider(),
-                Dispatcher
+                Dispatcher,
+                previewService: new LauncherActionTests.FakePreviewService()
             );
 
             Window = new MainWindow(ViewModel);

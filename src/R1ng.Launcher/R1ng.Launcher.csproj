@@ -10,6 +10,7 @@
     <AssemblyName>R1ngLauncher</AssemblyName>
     <RootNamespace>R1ng.Launcher</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\app.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <LangVersion>latest</LangVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
@@ -18,6 +19,11 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="R1ng.Launcher.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="..\..\app.ico" Link="app.ico" />
+    <Content Include="..\..\app.ico" Link="app.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

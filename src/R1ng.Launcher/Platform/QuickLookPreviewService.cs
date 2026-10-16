@@ -24,6 +24,12 @@ public interface IQuickLookPreviewService
     /// than an exception, so a caller never has to observe a faulted task.
     /// </summary>
     Task<QuickLookPreviewResult> PreviewAsync(SearchResultItem item, CancellationToken cancellationToken = default);
+
+    /// <summary>Switches an already-open QuickLook preview to this item; it never opens or closes a preview.</summary>
+    Task<QuickLookPreviewResult> SwitchAsync(SearchResultItem item, CancellationToken cancellationToken = default);
+
+    /// <summary>Closes the current non-pinned preview; never toggles, opens a window, or quits QuickLook.</summary>
+    Task<QuickLookPreviewResult> CloseAsync(CancellationToken cancellationToken = default);
 }
 
 /// <summary>Outcome of a preview request; <see cref="Message"/> is ready to show to the user.</summary>
@@ -39,6 +45,8 @@ public sealed class QuickLookPreviewService : IQuickLookPreviewService
 {
     internal const string PipeNamePrefix = "QuickLook.App.Pipe.";
     internal const string ToggleCommand = "QuickLook.App.PipeMessages.Toggle";
+    internal const string SwitchCommand = "QuickLook.App.PipeMessages.Switch";
+    internal const string CloseCommand = "QuickLook.App.PipeMessages.Close";
 
     private const int MaxPathLength = 32767;
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMilliseconds(1500);
@@ -81,7 +89,20 @@ public sealed class QuickLookPreviewService : IQuickLookPreviewService
 
     public bool CanPreview(SearchResultItem item) => item is not null && TryGetPreviewPath(item, out _);
 
-    public async Task<QuickLookPreviewResult> PreviewAsync(SearchResultItem item, CancellationToken cancellationToken = default)
+    public Task<QuickLookPreviewResult> PreviewAsync(SearchResultItem item, CancellationToken cancellationToken = default) =>
+        SendItemAsync(item, ToggleCommand, cancellationToken);
+
+    public Task<QuickLookPreviewResult> SwitchAsync(SearchResultItem item, CancellationToken cancellationToken = default) =>
+        SendItemAsync(item, SwitchCommand, cancellationToken);
+
+    public Task<QuickLookPreviewResult> CloseAsync(CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.IsCancellationRequested) return Task.FromResult(Cancelled);
+        return _pipeName is null ? Task.FromResult(UnknownUser)
+            : SendAsync(_pipeName, BuildMessage(string.Empty, CloseCommand), cancellationToken);
+    }
+
+    private async Task<QuickLookPreviewResult> SendItemAsync(SearchResultItem item, string command, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(item);
 
@@ -111,7 +132,7 @@ public sealed class QuickLookPreviewService : IQuickLookPreviewService
         if (!exists)
             return Missing;
 
-        return await SendAsync(_pipeName, BuildMessage(path), cancellationToken).ConfigureAwait(false);
+        return await SendAsync(_pipeName, BuildMessage(path, command), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The pipe QuickLook listens on for the current Windows user, or null when the SID is unknown.</summary>
@@ -129,8 +150,8 @@ public sealed class QuickLookPreviewService : IQuickLookPreviewService
         }
     }
 
-    /// <summary>The exact bytes of a Toggle request for an already validated path: UTF-8, no BOM.</summary>
-    internal static byte[] BuildMessage(string path) => StrictUtf8.GetBytes(ToggleCommand + "|" + path + "|\n");
+    /// <summary>The exact bytes of a protocol request for an already validated path: UTF-8, no BOM.</summary>
+    internal static byte[] BuildMessage(string path, string command = ToggleCommand) => StrictUtf8.GetBytes(command + "|" + path + "|\n");
 
     /// <summary>
     /// Validates and normalises the row's target without any file system access. Shortcuts (.lnk,

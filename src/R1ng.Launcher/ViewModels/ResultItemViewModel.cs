@@ -9,6 +9,7 @@ public sealed class ResultItemViewModel : ObservableObject
 {
     private ImageSource? _icon;
     private bool _isPinned;
+    private bool _isSelected;
 
     public ResultItemViewModel(SearchResultItem model, LauncherViewModel owner, SearchContext? context = null)
     {
@@ -26,6 +27,12 @@ public sealed class ResultItemViewModel : ObservableObject
     public SearchResultItem Model { get; }
 
     public SearchContext? Context { get; }
+
+    public bool IsSelected
+    {
+        get => _isSelected;
+        internal set => SetProperty(ref _isSelected, value);
+    }
 
     public bool IsPinned
     {

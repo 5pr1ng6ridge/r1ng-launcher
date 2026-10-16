@@ -41,6 +41,105 @@ public class MainWindowActionTests
     private static readonly FieldInfo ReportedKeyField =
         typeof(KeyEventArgs).GetField("_key", BindingFlags.Instance | BindingFlags.NonPublic)!;
 
+    [Fact]
+    public async Task Clicking_the_initially_selected_first_row_still_switches_an_existing_preview()
+    {
+        await RunAsync(harness =>
+        {
+            harness.ShowRows(3);
+            Assert.Equal(0, harness.ViewModel.SelectedIndex);
+            Click(HitOf(harness, 0), MouseButton.Left, 1);
+            Assert.Equal(Item(1).Target, Assert.Single(harness.Preview.SwitchRequests).Target);
+            Assert.Empty(harness.Preview.Requests);
+            // Another explicit preview may have targeted a different context-menu row.
+            harness.ViewModel.Preview(harness.ViewModel.Results[2]);
+            Dispatcher.CurrentDispatcher.Invoke(DispatcherPriority.ApplicationIdle, new Action(() => { }));
+            Click(HitOf(harness, 0), MouseButton.Left, 1);
+            Assert.Equal(2, harness.Preview.SwitchRequests.Count);
+            Assert.Equal(Item(1).Target, harness.Preview.SwitchRequests[^1].Target);
+        });
+    }
+
+    [Theory]
+    [InlineData(SearchScope.All, false)]
+    [InlineData(SearchScope.Applications, false)]
+    [InlineData(SearchScope.Files, false)]
+    [InlineData(SearchScope.All, true)]
+    [InlineData(SearchScope.Applications, true)]
+    [InlineData(SearchScope.Files, true)]
+    public async Task A_single_click_selects_the_hit_search_row_without_opening_or_taking_query_focus(SearchScope scope, bool hitPadding)
+    {
+        await RunAsync(harness =>
+        {
+            harness.SetRows(3);
+            harness.ViewModel.SetScope(scope);
+            ShowFocused(harness);
+            harness.Window.UpdateLayout();
+            Assert.Equal(scope == SearchScope.All ? 6 : 3, harness.ViewModel.Results.Count);
+            var row = harness.ViewModel.Results[1];
+            var container = Assert.IsType<ListBoxItem>(harness.Window.ResultsList.ItemContainerGenerator.ContainerFromIndex(1));
+            var hit = hitPadding ? Assert.IsType<Border>(container.Template.FindName("RowBackground", container)) : HitOf(harness, 1);
+
+            Assert.False(Click(hit, MouseButton.Left, 1));
+            Assert.Equal(1, harness.ViewModel.SelectedIndex);
+            Assert.Same(row, harness.ViewModel.SelectedItem);
+            Assert.Equal(1, harness.Window.ResultsList.SelectedIndex);
+            Assert.True(row.IsSelected);
+            Assert.False(harness.ViewModel.Results[0].IsSelected);
+            Assert.True(harness.Window.SearchBox.IsKeyboardFocusWithin);
+            Assert.True(harness.Window.IsVisible);
+            Assert.Empty(harness.Open.Targets);
+            Assert.Empty(harness.History.Recorded);
+            Assert.Equal(row.Model.Target, Assert.Single(harness.Preview.SwitchRequests).Target);
+            Assert.Empty(harness.Preview.Requests);
+            // Repeated clicks on the same item do not send another switch.
+            Click(hit, MouseButton.Left, 1);
+            Assert.Single(harness.Preview.SwitchRequests);
+
+            Assert.True(Press(harness.Window, Key.Enter).Handled);
+            Assert.Equal(row.Model.Target, Assert.Single(harness.Open.Targets));
+        }, new FixedFiles(3));
+    }
+
+    [Theory]
+    [InlineData(SearchScope.All)]
+    [InlineData(SearchScope.Applications)]
+    [InlineData(SearchScope.Files)]
+    public async Task A_single_click_on_a_virtualized_scrolled_row_selects_its_actual_collection_index(SearchScope scope)
+    {
+        await RunAsync(harness =>
+        {
+            harness.SetRows(50);
+            harness.ViewModel.SetScope(scope);
+            ShowFocused(harness);
+            var dispatcher = Dispatcher.CurrentDispatcher;
+            dispatcher.Invoke(DispatcherPriority.ApplicationIdle, new Action(() => { }));
+            var list = harness.Window.ResultsList;
+            Assert.Null(list.ItemContainerGenerator.ContainerFromIndex(40));
+            var clicked = harness.ViewModel.Results[40];
+            list.ScrollIntoView(clicked);
+            dispatcher.Invoke(DispatcherPriority.ApplicationIdle, new Action(() => { }));
+            harness.Window.UpdateLayout();
+            Assert.False(Click(HitOf(harness, 40), MouseButton.Left, 1));
+            Assert.Equal(40, harness.ViewModel.SelectedIndex);
+            Assert.Same(clicked, harness.ViewModel.SelectedItem);
+            Assert.True(clicked.IsSelected);
+            Assert.Equal(clicked.Model.Target, Assert.Single(harness.Preview.SwitchRequests).Target);
+            Assert.Empty(harness.Preview.Requests);
+            Assert.True(harness.Window.SearchBox.IsKeyboardFocusWithin);
+            Assert.Empty(harness.Open.Targets);
+            Assert.Empty(harness.History.Recorded);
+        }, new FixedFiles(50));
+    }
+
+    private sealed class FixedFiles(int count) : IFileSearchProvider
+    {
+        public Task<FileSearchOutcome> SearchAsync(string query, CancellationToken cancellationToken,
+            FileSearchOptions options = default, string? folderConstraint = null) =>
+            Task.FromResult(new FileSearchOutcome(FileSearchAvailability.Ready(), Enumerable.Range(1, count)
+                .Select(index => new FileSearchHit($@"C:\fake\item-{index}.txt", false)).ToArray()));
+    }
+
     // ----- double click ------------------------------------------------------------------------------
 
     [Fact]
@@ -58,7 +157,7 @@ public class MainWindowActionTests
             Assert.True(handled);
             Assert.Equal(new[] { Item(2).Target }, harness.Open.Targets);
             Assert.Equal(Item(2).Target, Assert.Single(harness.History.Recorded).Target);
-            Assert.Equal(0, harness.ViewModel.SelectedIndex);
+            Assert.Equal(1, harness.ViewModel.SelectedIndex);
         });
     }
 
@@ -87,10 +186,14 @@ public class MainWindowActionTests
             var list = harness.Window.ResultsList;
             var scroll = Descendants(list).OfType<ScrollViewer>().First();
 
-            Assert.False(Click(HitOf(harness, 0), MouseButton.Left, 1));
+            Assert.False(Click(HitOf(harness, 1), MouseButton.Left, 1));
+            Assert.Equal(1, harness.ViewModel.SelectedIndex);
             Assert.False(Click(list, MouseButton.Left, 2));
             Assert.False(Click(scroll, MouseButton.Left, 2));
-            Assert.False(Click(HitOf(harness, 1), MouseButton.Right, 2));
+            var scrollBar = Descendants(list).OfType<System.Windows.Controls.Primitives.ScrollBar>().First();
+            Assert.False(Click(scrollBar, MouseButton.Left, 1));
+            Assert.False(Click(HitOf(harness, 0), MouseButton.Right, 2));
+            Assert.Equal(1, harness.ViewModel.SelectedIndex);
 
             Assert.Empty(harness.Open.Targets);
             Assert.Empty(harness.History.Recorded);
@@ -130,6 +233,28 @@ public class MainWindowActionTests
             harness.SetModifiers(ModifierKeys.Control | ModifierKeys.Alt);
             Assert.False(Press(harness.Window, Key.Space).Handled);
             Assert.Single(harness.Preview.Requests);
+        });
+    }
+
+    [Fact]
+    public async Task Up_and_down_switch_only_an_existing_preview_and_unsupported_rows_are_safe()
+    {
+        await RunAsync(harness =>
+        {
+            harness.SetRows(3);
+            ShowFocused(harness);
+
+            Assert.True(Press(harness.Window, Key.Down).Handled);
+            Assert.Equal(new[] { Item(2).Target }, harness.Preview.SwitchRequests.Select(item => item.Target));
+            Assert.True(Press(harness.Window, Key.Up).Handled);
+            Assert.Equal(new[] { Item(2).Target, Item(1).Target }, harness.Preview.SwitchRequests.Select(item => item.Target));
+            Assert.Empty(harness.Preview.Requests);
+            Assert.True(harness.Window.IsVisible);
+
+            harness.Preview.CanPreviewResult = false;
+            Press(harness.Window, Key.Down);
+            Assert.Equal(2, harness.Preview.SwitchRequests.Count);
+            Assert.Empty(harness.Preview.Requests);
         });
     }
 
@@ -196,36 +321,34 @@ public class MainWindowActionTests
     }
 
     [Fact]
-    public async Task The_new_footer_actions_use_the_neutral_hover_and_only_quit_keeps_the_red_one()
+    public async Task The_header_keeps_the_editor_indicator_and_accessible_tooltip_free_theme_toggle()
     {
         await RunAsync(harness =>
         {
             var window = harness.Window;
-            var neutral = Assert.IsType<Style>(window.Resources["FooterActionButtonStyle"]);
-            var quit = Assert.IsType<Style>(window.Resources["FooterButtonStyle"]);
-
-            Assert.NotSame(neutral, quit);
+            var neutral = Assert.IsType<Style>(window.Resources["EditorActionButtonStyle"]);
+            var themeStyle = Assert.IsType<Style>(window.Resources["ThemeToggleStyle"]);
             Assert.Same(neutral, window.EditingButton.Style);
-            Assert.Same(neutral, window.HiddenItemsButton.Style);
+            Assert.Same(themeStyle, window.ThemeToggleButton.Style);
 
-            // The window was never shown, so look for the quit button in the laid-out content.
             harness.Layout();
-            var quitButton = Descendants((DependencyObject)window.Content)
-                .OfType<Button>()
-                .First(button => button.Content as string == "退出");
-            Assert.Same(quit, quitButton.Style);
+            Assert.Null(window.ThemeToggleButton.ToolTip);
+            Assert.Null(ToolTipService.GetToolTip(window.ThemeToggleButton));
+            Assert.Equal("切换到浅色主题", AutomationProperties.GetName(window.ThemeToggleButton));
+            Assert.DoesNotContain(Descendants((DependencyObject)window.Content).OfType<Button>(), button =>
+                button.Content as string is "退出" or "已隐藏");
         });
     }
 
     [Fact]
-    public async Task Ctrl_Space_and_Ctrl_G_leave_the_keys_alone_while_the_theme_selector_owns_the_keyboard()
+    public async Task Ctrl_Space_and_Ctrl_G_leave_the_keys_alone_while_the_theme_button_owns_the_keyboard()
     {
         await RunAsync(harness =>
         {
             harness.SetRows(1);
             ShowFocused(harness);
-            Keyboard.Focus(harness.Window.ThemeSelector);
-            Assert.True(harness.Window.ThemeSelector.IsKeyboardFocusWithin, "the theme selector could not take focus");
+            Keyboard.Focus(harness.Window.ThemeToggleButton);
+            Assert.True(harness.Window.ThemeToggleButton.IsKeyboardFocusWithin, "the theme button could not take focus");
             Assert.False(harness.Window.SearchBox.IsKeyboardFocusWithin);
             harness.SetModifiers(ModifierKeys.Control);
 
@@ -699,6 +822,45 @@ public class MainWindowActionTests
 
     // ----- closing ---------------------------------------------------------------------------------------
 
+    [Theory]
+    [InlineData("last saved")]
+    [InlineData("")]
+    public async Task Closing_the_corresponding_draft_tab_copies_its_final_saved_text_and_shows_the_launcher(string savedText)
+    {
+        await RunAsync(harness =>
+        {
+            var session = StartSession(harness, "draft text");
+            var draft = harness.Editor.DraftPath;
+            Assert.False(harness.Window.IsVisible);
+
+            harness.Editor.RaiseClosed(new QueryEditorClosed(session, savedText));
+
+            Assert.Equal(new[] { savedText }, harness.ClipboardTexts);
+            Assert.True(harness.Window.IsVisible);
+            Assert.Null(harness.Window.EditingSessionId);
+            Assert.Equal(1, harness.Editor.EndSessionCount);
+            Assert.Equal(Visibility.Collapsed, harness.Window.EditingButton.Visibility);
+            Assert.Equal(draft, harness.Editor.DraftPath);
+            Assert.Contains("最后保存", harness.ViewModel.ActionNotice);
+        });
+    }
+
+    [Fact]
+    public async Task A_stale_tab_close_is_ignored_and_does_not_copy_or_show_the_launcher()
+    {
+        await RunAsync(harness =>
+        {
+            StartSession(harness, "draft");
+
+            harness.Editor.RaiseClosed(new QueryEditorClosed(Guid.NewGuid(), "unrelated"));
+
+            Assert.Empty(harness.ClipboardTexts);
+            Assert.False(harness.Window.IsVisible);
+            Assert.NotNull(harness.Window.EditingSessionId);
+            Assert.Equal(0, harness.Editor.EndSessionCount);
+        });
+    }
+
     [Fact]
     public async Task Closing_the_window_releases_the_editor_without_ending_the_users_session()
     {
@@ -707,6 +869,7 @@ public class MainWindowActionTests
             var session = StartSession(harness, "abc");
             Assert.Equal(1, harness.Editor.SavedSubscribers);
             Assert.Equal(1, harness.Editor.FailedSubscribers);
+            Assert.Equal(1, harness.Editor.ClosedSubscribers);
 
             harness.CloseWindow();
 
@@ -714,12 +877,38 @@ public class MainWindowActionTests
             Assert.Equal(0, harness.Editor.EndSessionCount);
             Assert.Equal(0, harness.Editor.SavedSubscribers);
             Assert.Equal(0, harness.Editor.FailedSubscribers);
+            Assert.Equal(0, harness.Editor.ClosedSubscribers);
 
             // Late callbacks (including a direct call) change nothing and do not throw.
             harness.Editor.RaiseSaved(new QueryEditorSaved(session, 1, "late"));
+            harness.Editor.RaiseClosed(new QueryEditorClosed(session, "late close"));
             harness.Window.HandleEditorSaved(new QueryEditorSaved(session, 2, "later"));
             Assert.Equal("abc", harness.ViewModel.Query);
             Assert.Null(harness.Window.EditingSessionId);
+        });
+    }
+
+    [Fact]
+    public async Task A_tab_that_closes_before_start_returns_is_reconciled_without_hiding_the_launcher_again()
+    {
+        await RunAsync(harness =>
+        {
+            var pending = new TaskCompletionSource<QueryEditorStartResult>();
+            harness.Editor.StartBehavior = _ => pending.Task;
+            harness.ViewModel.Query = "draft";
+            ShowFocused(harness);
+            harness.SetModifiers(ModifierKeys.Control);
+            Press(harness.Window, Key.G);
+
+            var session = Guid.NewGuid();
+            harness.Editor.CurrentSessionId = session;
+            harness.Editor.RaiseClosed(new QueryEditorClosed(session, "final saved"));
+            pending.SetResult(new QueryEditorStartResult(true, session, null));
+
+            Assert.True(harness.Window.IsVisible);
+            Assert.Null(harness.Window.EditingSessionId);
+            Assert.Equal(new[] { "final saved" }, harness.ClipboardTexts);
+            Assert.Equal(1, harness.Editor.EndSessionCount);
         });
     }
 
@@ -800,12 +989,13 @@ public class MainWindowActionTests
                 Assert.Equal("恢复全部", AutomationProperties.GetName(dialog.RestoreAllButton));
                 Assert.Equal(Visibility.Collapsed, dialog.EmptyText.Visibility);
 
-                // A failed restore keeps the item listed and shows the reason inside the window.
+                // A failed restore keeps the item listed and routes the reason to a transient notice.
                 harness.Hidden.FailNext = "无法保存";
                 Assert.False(dialog.RestoreOne(dialog.Rows[0].Key));
                 Assert.Equal(2, dialog.Rows.Count);
-                Assert.Equal(Visibility.Visible, dialog.ErrorBanner.Visibility);
-                Assert.Contains("无法保存", dialog.ErrorText.Text);
+                Assert.Null(dialog.FindName("ErrorBanner"));
+                Assert.Contains("无法保存", dialog.ErrorMessage);
+                Assert.Contains("无法保存", harness.ViewModel.ActionNotice);
 
                 Assert.True(dialog.RestoreOne(dialog.Rows[0].Key));
                 Assert.Equal(new[] { "item 1" }, dialog.Rows.Select(row => row.Title));
@@ -815,7 +1005,7 @@ public class MainWindowActionTests
                 Assert.Empty(dialog.Rows);
                 Assert.False(dialog.RestoreAllButton.IsEnabled);
                 Assert.Equal(Visibility.Visible, dialog.EmptyText.Visibility);
-                Assert.Equal(Visibility.Collapsed, dialog.ErrorBanner.Visibility);
+                Assert.Null(dialog.ErrorMessage);
                 Assert.Equal(0, harness.ViewModel.HiddenCount);
                 return null;
             };
@@ -825,16 +1015,16 @@ public class MainWindowActionTests
     }
 
     [Fact]
-    public async Task The_footer_offers_the_hidden_manager_and_keeps_every_control_inside_the_window()
+    public async Task The_header_keeps_its_theme_toggle_and_editing_indicator_inside_the_window()
     {
         await RunAsync(harness =>
         {
             // Bindings only come alive once the content has been laid out.
             harness.Layout();
-            Assert.Same(harness.ViewModel.ManageHiddenCommand, harness.Window.HiddenItemsButton.Command);
+            Assert.Same(harness.ViewModel.ToggleThemeCommand, harness.Window.ThemeToggleButton.Command);
             Assert.Equal(Visibility.Collapsed, harness.Window.EditingButton.Visibility);
 
-            // With an editing session the footer is at its fullest.
+            // With an editing session the header is at its fullest.
             StartSession(harness, "abc");
             harness.Window.ShowLauncher();
             harness.Window.UpdateLayout();
@@ -843,9 +1033,7 @@ public class MainWindowActionTests
             var controls = new FrameworkElement[]
             {
                 window.EditingButton,
-                window.HiddenItemsButton,
-                window.ThemeSelector,
-                FindButton(window, "退出"),
+                window.ThemeToggleButton,
             };
             Rect previous = default;
             foreach (var control in controls)
@@ -854,12 +1042,79 @@ public class MainWindowActionTests
                 var bounds = BoundsIn(window, control);
                 Assert.True(bounds.Right <= window.ActualWidth + 1.5, $"{control.GetType().Name} sticks out of the window");
                 Assert.True(bounds.Bottom <= window.ActualHeight + 1.5);
-                Assert.True(bounds.Left >= previous.Right - 1.5, "footer controls must not overlap");
+                Assert.True(bounds.Left >= previous.Right - 1.5, "header controls must not overlap");
+                Assert.True(bounds.Bottom <= BoundsIn(window, window.SearchHeader).Bottom + 1.5);
                 previous = bounds;
             }
 
-            // The notice column still has room for a readable message.
-            Assert.True(window.FooterHintText.ActualWidth >= 120, $"the notice column is only {window.FooterHintText.ActualWidth} wide");
+            Assert.True(window.SearchBox.ActualWidth >= 120, $"the query is only {window.SearchBox.ActualWidth} wide");
+            Assert.Null(window.FindName("FooterHintText"));
+            Assert.DoesNotContain(Descendants((DependencyObject)window.Content).OfType<TextBlock>(),
+                text => text.Text.StartsWith("Tab 范围", StringComparison.Ordinal));
+        });
+    }
+
+    [Fact]
+    public async Task Header_actions_and_on_demand_notices_leave_the_query_usable_on_a_narrow_work_area()
+    {
+        await RunAsync(harness =>
+        {
+            var window = harness.Window;
+            var monitor = ScreenPlacement.SampleCursorMonitor();
+            window.SampleMonitor = () => monitor with
+            {
+                WorkArea = new ScreenPlacement.PixelsRect(monitor.WorkArea.Left, monitor.WorkArea.Top,
+                    monitor.WorkArea.Left + (int)(420 * monitor.DpiScale),
+                    monitor.WorkArea.Top + (int)(330 * monitor.DpiScale)),
+            };
+            var session = StartSession(harness, "draft");
+            harness.ViewModel.Query = "newer query";
+            harness.Editor.RaiseSaved(new QueryEditorSaved(session, 1, "saved text"));
+            window.ShowLauncher();
+            Dispatcher.CurrentDispatcher.Invoke(DispatcherPriority.ApplicationIdle, new Action(() => { }));
+            window.UpdateLayout();
+
+            Assert.True(window.SearchBox.ActualWidth >= 100, $"query width {window.SearchBox.ActualWidth}");
+            var header = BoundsIn(window, window.SearchHeader);
+            var query = BoundsIn(window, window.SearchBox);
+            Assert.True(query.Right <= BoundsIn(window, window.HeaderActions).Left + 1.5);
+            foreach (var action in new[] { window.EditingButton, window.ThemeToggleButton })
+            {
+                var bounds = BoundsIn(window, action);
+                Assert.True(bounds.Right <= header.Right + 1.5);
+                Assert.True(bounds.Top >= header.Top - 1.5 && bounds.Bottom <= header.Bottom + 1.5);
+            }
+            Assert.Null(window.FindName("ActionNoticeBanner"));
+            Assert.Null(window.FindName("FileNoticeBanner"));
+            Assert.Null(window.FindName("HotKeyNoticeBanner"));
+            var results = BoundsIn(window, window.ResultsViewport);
+            var heightWithNotice = window.ActualHeight;
+            Assert.True(results.Height > 0);
+            Assert.Null(window.FindName("FooterHintText"));
+
+            harness.ViewModel.SetActionNotice(null);
+            window.UpdateLayout();
+            Assert.Equal(heightWithNotice, window.ActualHeight);
+            Assert.True(window.ActualHeight < window.MaxHeight, "notices never affect content-sized height");
+        });
+    }
+
+    [Fact]
+    public async Task Editor_start_captures_only_desktop_identity_before_hiding_the_launcher()
+    {
+        await RunAsync(harness =>
+        {
+            var context = new QueryEditorLaunchContext(Guid.NewGuid());
+            var capturedWhileVisible = false;
+            harness.Window.SampleEditorContext = () =>
+            {
+                capturedWhileVisible = harness.Window.IsVisible;
+                return context;
+            };
+            StartSession(harness, "draft");
+            Assert.True(capturedWhileVisible);
+            Assert.Equal(context, Assert.Single(harness.Editor.LaunchContexts));
+            Assert.Empty(harness.ClipboardTexts);
         });
     }
 
@@ -901,6 +1156,8 @@ public class MainWindowActionTests
         public required OpenState Open { get; init; }
 
         public bool WindowClosed { get; private set; }
+
+        public List<string> ClipboardTexts { get; init; } = new();
 
         public void SetModifiers(ModifierKeys modifiers) => Window.ModifierProvider = () => modifiers;
 
@@ -948,7 +1205,7 @@ public class MainWindowActionTests
         }
     }
 
-    private static async Task RunAsync(Action<Harness> body)
+    private static async Task RunAsync(Action<Harness> body, IFileSearchProvider? files = null)
     {
         Exception? failure = null;
         using var done = new ManualResetEventSlim(false);
@@ -964,9 +1221,10 @@ public class MainWindowActionTests
                 var preview = new FakePreviewService();
                 var editor = new FakeQueryEditor();
                 var open = new OpenState();
+                var clipboardTexts = new List<string>();
 
                 using var viewModel = new LauncherViewModel(
-                    new SearchController(apps, new NoopFileProvider()),
+                    new SearchController(apps, files ?? new NoopFileProvider()),
                     history,
                     Dispatcher.CurrentDispatcher,
                     iconLoader: (_, _, _) => null,
@@ -981,7 +1239,15 @@ public class MainWindowActionTests
                     previewService: preview
                 );
 
-                var window = new MainWindow(viewModel, explorerFolderResolver: _ => null, queryEditor: editor);
+                var window = new MainWindow(
+                    viewModel,
+                    explorerFolderResolver: _ => null,
+                    queryEditor: editor,
+                    copyTextToClipboard: text =>
+                    {
+                        clipboardTexts.Add(text);
+                        return true;
+                    });
                 harness = new Harness
                 {
                     Window = window,
@@ -992,6 +1258,7 @@ public class MainWindowActionTests
                     Apps = apps,
                     History = history,
                     Open = open,
+                    ClipboardTexts = clipboardTexts,
                 };
 
                 try
@@ -1135,12 +1402,15 @@ public class MainWindowActionTests
     {
         private Action<QueryEditorSaved>? _saved;
         private Action<QueryEditorError>? _failed;
+        private Action<QueryEditorClosed>? _closed;
 
         public Guid? CurrentSessionId { get; set; }
 
         public string? DraftPath { get; set; } = @"C:\fake\drafts\r1ng-test.txt";
 
         public List<string> StartTexts { get; } = new();
+
+        public List<QueryEditorLaunchContext?> LaunchContexts { get; } = new();
 
         public int RefreshCount { get; private set; }
 
@@ -1158,6 +1428,8 @@ public class MainWindowActionTests
 
         public int FailedSubscribers => _failed?.GetInvocationList().Length ?? 0;
 
+        public int ClosedSubscribers => _closed?.GetInvocationList().Length ?? 0;
+
         public event Action<QueryEditorSaved>? Saved
         {
             add => _saved += value;
@@ -1168,6 +1440,12 @@ public class MainWindowActionTests
         {
             add => _failed += value;
             remove => _failed -= value;
+        }
+
+        public event Action<QueryEditorClosed>? Closed
+        {
+            add => _closed += value;
+            remove => _closed -= value;
         }
 
         public Task<QueryEditorStartResult> StartAsync(string text, CancellationToken cancellationToken = default)
@@ -1182,6 +1460,12 @@ public class MainWindowActionTests
             var id = Guid.NewGuid();
             CurrentSessionId = id;
             return Task.FromResult(new QueryEditorStartResult(true, id, null));
+        }
+
+        public Task<QueryEditorStartResult> StartAsync(string text, QueryEditorLaunchContext? launchContext, CancellationToken cancellationToken = default)
+        {
+            LaunchContexts.Add(launchContext);
+            return StartAsync(text, cancellationToken);
         }
 
         public Task RefreshAsync(CancellationToken cancellationToken = default)
@@ -1206,5 +1490,7 @@ public class MainWindowActionTests
         public void RaiseSaved(QueryEditorSaved saved) => _saved?.Invoke(saved);
 
         public void RaiseFailed(QueryEditorError error) => _failed?.Invoke(error);
+
+        public void RaiseClosed(QueryEditorClosed closed) => _closed?.Invoke(closed);
     }
 }

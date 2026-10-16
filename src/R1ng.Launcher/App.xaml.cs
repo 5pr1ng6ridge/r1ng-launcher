@@ -103,11 +103,11 @@ public partial class App : Application
         if (TryGetSwitchValue(e.Args, "--query", out var query))
             _window.ShowWithQuery(query);
 
-        // Never strand a resident process with no way to open or exit it: when neither hotkey could be
-        // registered, come up visible with the diagnostic banner and the footer “退出” button.
-        if (!hotKeyAvailable)
+        // Never strand a resident process: the tray is the reopen/quit route. If tray creation fails,
+        // surface the diagnostic in a visible window; with no hotkey and no tray, Alt+F4 exits.
+        if (!hotKeyAvailable || !_window.TrayIconAvailable)
         {
-            Log("global hotkeys unavailable; showing the launcher with the diagnostic banner");
+            Log("global hotkey or tray unavailable; showing the launcher with a floating diagnostic notice");
             _window.ShowLauncher();
         }
     }

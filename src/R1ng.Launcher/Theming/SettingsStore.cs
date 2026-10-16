@@ -74,6 +74,6 @@ public sealed class SettingsStore
         }
     }
 
-    /// <summary>Convenience helper used by the theme selector.</summary>
+    /// <summary>Convenience helper used by the theme toggle.</summary>
     public bool SaveTheme(AppTheme theme) => Save(LauncherSettings.Default with { Theme = theme });
 }
